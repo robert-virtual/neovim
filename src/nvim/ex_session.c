@@ -187,11 +187,14 @@ static int ses_do_win(win_T *wp)
   }
   if (wp->w_buffer->b_fname == NULL
       // When 'buftype' is "nofile" can't restore the window contents.
-      || (!wp->w_buffer->terminal && bt_nofile(wp->w_buffer))) {
+      || (!wp->w_buffer->terminal && bt_nofilename(wp->w_buffer))) {
     return ssop_flags & SSOP_BLANK;
   }
   if (bt_help(wp->w_buffer)) {
     return ssop_flags & SSOP_HELP;
+  }
+  if (bt_terminal(wp->w_buffer)) {
+    return ssop_flags & SSOP_TERMINAL;
   }
   return true;
 }
@@ -285,7 +288,7 @@ static char *ses_escape_fname(char *name, unsigned *flagp)
   }
 
   // Escape special characters.
-  p = vim_strsave_fnameescape(sname, false);
+  p = vim_strsave_fnameescape(sname, VSE_NONE);
   xfree(sname);
   return p;
 }
@@ -363,7 +366,7 @@ static int put_view(FILE *fd, win_T *wp, int add_edit, unsigned *flagp, int curr
         return FAIL;
       }
     } else if (wp->w_buffer->b_ffname != NULL
-               && (!bt_nofile(wp->w_buffer) || wp->w_buffer->terminal)) {
+               && (!bt_nofilename(wp->w_buffer) || wp->w_buffer->terminal)) {
       // Load the file.
 
       // Editing a file in this buffer: use ":edit file".
@@ -407,6 +410,8 @@ static int put_view(FILE *fd, win_T *wp, int add_edit, unsigned *flagp, int curr
     if ((flagp == &ssop_flags) && alt != NULL && alt->b_fname != NULL
         && *alt->b_fname != NUL
         && alt->b_p_bl
+        // do not set balt if buffer is terminal and "terminal" is not set in options
+        && !(bt_terminal(alt) && !(ssop_flags & SSOP_TERMINAL))
         && (fputs("balt ", fd) < 0
             || ses_fname(fd, alt, flagp, true) == FAIL)) {
       return FAIL;
@@ -616,6 +621,7 @@ static int makeopens(FILE *fd, char_u *dirnow)
   FOR_ALL_BUFFERS(buf) {
     if (!(only_save_windows && buf->b_nwindows == 0)
         && !(buf->b_help && !(ssop_flags & SSOP_HELP))
+        && !(bt_terminal(buf) && !(ssop_flags & SSOP_TERMINAL))
         && buf->b_fname != NULL
         && buf->b_p_bl) {
       if (fprintf(fd, "badd +%" PRId64 " ",
@@ -706,7 +712,7 @@ static int makeopens(FILE *fd, char_u *dirnow)
       if (ses_do_win(wp)
           && wp->w_buffer->b_ffname != NULL
           && !bt_help(wp->w_buffer)
-          && !bt_nofile(wp->w_buffer)) {
+          && !bt_nofilename(wp->w_buffer)) {
         if (need_tabnext && put_line(fd, "tabnext") == FAIL) {
           return FAIL;
         }

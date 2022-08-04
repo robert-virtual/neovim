@@ -1583,22 +1583,39 @@ char *make_filter_cmd(char *cmd, char *itmp, char *otmp)
   if (otmp != NULL) {
     len += STRLEN(otmp) + STRLEN(p_srr) + 2;  // two extra spaces ("  "),
   }
+
+  const char *const cmd_args = strchr(cmd, ' ');
+  len += (is_pwsh && cmd_args)
+      ? STRLEN(" -ArgumentList ") + 2  // two extra quotes
+      : 0;
+
   char *const buf = xmalloc(len);
 
-#if defined(UNIX)
-  // Put delimiters around the command (for concatenated commands) when
-  // redirecting input and/or output.
   if (is_pwsh) {
     xstrlcpy(buf, "Start-Process ", len);
-    xstrlcat(buf, cmd, len);
+    if (cmd_args == NULL) {
+      xstrlcat(buf, cmd, len);
+    } else {
+      xstrlcpy(buf + STRLEN(buf), cmd, (size_t)(cmd_args - cmd + 1));
+      xstrlcat(buf, " -ArgumentList \"", len);
+      xstrlcat(buf, cmd_args + 1, len);  // +1 to skip the leading space.
+      xstrlcat(buf, "\"", len);
+    }
+#if defined(UNIX)
+    // Put delimiters around the command (for concatenated commands) when
+    // redirecting input and/or output.
   } else if (itmp != NULL || otmp != NULL) {
     char *fmt = is_fish_shell ? "begin; %s; end"
                               :       "(%s)";
     vim_snprintf(buf, len, fmt, cmd);
+#endif
+    // For shells that don't understand braces around commands, at least allow
+    // the use of commands in a pipe.
   } else {
     xstrlcpy(buf, cmd, len);
   }
 
+#if defined(UNIX)
   if (itmp != NULL) {
     if (is_pwsh) {
       xstrlcat(buf, " -RedirectStandardInput ", len - 1);
@@ -1608,14 +1625,6 @@ char *make_filter_cmd(char *cmd, char *itmp, char *otmp)
     xstrlcat(buf, itmp, len - 1);
   }
 #else
-  // For shells that don't understand braces around commands, at least allow
-  // the use of commands in a pipe.
-  if (is_pwsh) {
-    xstrlcpy(buf, "Start-Process ", len);
-    xstrlcat(buf, cmd, len);
-  } else {
-    xstrlcpy(buf, cmd, len);
-  }
   if (itmp != NULL) {
     // If there is a pipe, we have to put the '<' in front of it.
     // Don't do this when 'shellquote' is not empty, otherwise the
@@ -1980,17 +1989,14 @@ theend:
 /// @return  OK if it's OK, FAIL if it is not.
 int check_overwrite(exarg_T *eap, buf_T *buf, char *fname, char *ffname, int other)
 {
-  /*
-   * write to other file or b_flags set or not writing the whole file:
-   * overwriting only allowed with '!'
-   */
+  // Write to another file or b_flags set or not writing the whole file:
+  // overwriting only allowed with '!'
   if ((other
        || (buf->b_flags & BF_NOTEDITED)
        || ((buf->b_flags & BF_NEW)
            && vim_strchr(p_cpo, CPO_OVERNEW) == NULL)
        || (buf->b_flags & BF_READERR))
       && !p_wa
-      && !bt_nofile(buf)
       && os_path_exists((char_u *)ffname)) {
     if (!eap->forceit && !eap->append) {
 #ifdef UNIX
@@ -2415,6 +2421,8 @@ int do_ecmd(int fnum, char *ffname, char *sfname, exarg_T *eap, linenr_T newlnum
    * Otherwise we re-use the current buffer.
    */
   if (other_file) {
+    const int prev_alt_fnum = curwin->w_alt_fnum;
+
     if (!(flags & (ECMD_ADDBUF | ECMD_ALTBUF))) {
       if ((cmdmod.cmod_flags & CMOD_KEEPALT) == 0) {
         curwin->w_alt_fnum = curbuf->b_fnum;
@@ -2457,6 +2465,10 @@ int do_ecmd(int fnum, char *ffname, char *sfname, exarg_T *eap, linenr_T newlnum
     }
     if (buf == NULL) {
       goto theend;
+    }
+    if (curwin->w_alt_fnum == buf->b_fnum && prev_alt_fnum != 0) {
+      // reusing the buffer, keep the old alternate file
+      curwin->w_alt_fnum = prev_alt_fnum;
     }
     if (buf->b_ml.ml_mfp == NULL) {
       // No memfile yet.
@@ -2712,6 +2724,12 @@ int do_ecmd(int fnum, char *ffname, char *sfname, exarg_T *eap, linenr_T newlnum
 
   // Assume success now
   retval = OK;
+
+  // If the file name was changed, reset the not-edit flag so that ":write"
+  // works.
+  if (!other_file) {
+    curbuf->b_flags &= ~BF_NOTEDITED;
+  }
 
   /*
    * Check if we are editing the w_arg_idx file in the argument list.
@@ -3579,7 +3597,7 @@ static int do_sub(exarg_T *eap, proftime_T timeout, long cmdpreview_ns, handle_T
   // check for a trailing count
   cmd = skipwhite(cmd);
   if (ascii_isdigit(*cmd)) {
-    i = getdigits_long((char_u **)&cmd, true, 0);
+    i = getdigits_long(&cmd, true, 0);
     if (i <= 0 && !eap->skip && subflags.do_error) {
       emsg(_(e_zerocount));
       return 0;
@@ -3632,7 +3650,6 @@ static int do_sub(exarg_T *eap, proftime_T timeout, long cmdpreview_ns, handle_T
 
   assert(sub != NULL);
 
-  bool sub_needs_free = false;
   char *sub_copy = NULL;
 
   // If the substitute pattern starts with "\=" then it's an expression.
@@ -3644,14 +3661,15 @@ static int do_sub(exarg_T *eap, proftime_T timeout, long cmdpreview_ns, handle_T
     sub = xstrdup(sub);
     sub_copy = sub;
   } else {
-    char *source = sub;
-    sub = (char *)regtilde((char_u *)sub, p_magic, cmdpreview);
-    // When previewing, the new pattern allocated by regtilde() needs to be freed
-    // in this function because it will not be used or freed by regtilde() later.
-    sub_needs_free = cmdpreview && sub != source;
+    char *newsub = (char *)regtilde((char_u *)sub, p_magic, cmdpreview);
+    if (newsub != sub) {
+      // newsub was allocated, free it later.
+      sub_copy = newsub;
+      sub = newsub;
+    }
   }
 
-  bool cmdheight0 = p_ch < 1 && !ui_has(kUIMessages);
+  const bool cmdheight0 = !ui_has_messages();
   if (cmdheight0) {
     // If cmdheight is 0, cmdheight must be set to 1 when we enter command line.
     set_option_value("ch", 1L, NULL, 0);
@@ -3868,6 +3886,7 @@ static int do_sub(exarg_T *eap, proftime_T timeout, long cmdpreview_ns, handle_T
                 curwin->w_cursor.col = 0;
               }
               getvcol(curwin, &curwin->w_cursor, NULL, NULL, &ec);
+              curwin->w_cursor.col = regmatch.startpos[0].col;
               if (subflags.do_number || curwin->w_p_nu) {
                 int numw = number_width(curwin) + 1;
                 sc += numw;
@@ -3877,7 +3896,7 @@ static int do_sub(exarg_T *eap, proftime_T timeout, long cmdpreview_ns, handle_T
               prompt = xmallocz((size_t)ec + 1);
               memset(prompt, ' ', (size_t)sc);
               memset(prompt + sc, '^', (size_t)(ec - sc) + 1);
-              resp = getcmdline_prompt((char)(-1), prompt, 0, EXPAND_NOTHING, NULL, CALLBACK_NONE);
+              resp = getcmdline_prompt(-1, prompt, 0, EXPAND_NOTHING, NULL, CALLBACK_NONE);
               msg_putchar('\n');
               xfree(prompt);
               if (resp != NULL) {
@@ -4446,9 +4465,6 @@ skip:
 
   vim_regfree(regmatch.regprog);
   xfree(sub_copy);
-  if (sub_needs_free) {
-    xfree(sub);
-  }
 
   // Restore the flag values, they can be used for ":&&".
   subflags.do_all = save_do_all;
@@ -4842,21 +4858,20 @@ void ex_help(exarg_T *eap)
       semsg(_("E149: Sorry, no help for %s"), arg);
     }
     if (n != FAIL) {
-      FreeWild(num_matches, (char_u **)matches);
+      FreeWild(num_matches, matches);
     }
     return;
   }
 
   // The first match (in the requested language) is the best match.
   tag = xstrdup(matches[i]);
-  FreeWild(num_matches, (char_u **)matches);
+  FreeWild(num_matches, matches);
 
   /*
    * Re-use an existing help window or open a new one.
    * Always open a new one for ":tab help".
    */
-  if (!bt_help(curwin->w_buffer)
-      || cmdmod.cmod_tab != 0) {
+  if (!bt_help(curwin->w_buffer) || cmdmod.cmod_tab != 0) {
     if (cmdmod.cmod_tab != 0) {
       wp = NULL;
     } else {
@@ -5039,7 +5054,7 @@ int find_help_tags(const char *arg, int *num_matches, char ***matches, bool keep
   int i;
 
   // Specific tags that either have a specific replacement or won't go
-  // throught the generic rules.
+  // through the generic rules.
   static char *(except_tbl[][2]) = {
     { "*",           "star" },
     { "g*",          "gstar" },
@@ -5272,7 +5287,7 @@ int find_help_tags(const char *arg, int *num_matches, char ***matches, bool keep
   if (keep_lang) {
     flags |= TAG_KEEP_LANG;
   }
-  if (find_tags(IObuff, num_matches, (char_u ***)matches, flags, MAXCOL, NULL) == OK
+  if (find_tags(IObuff, num_matches, matches, flags, MAXCOL, NULL) == OK
       && *num_matches > 0) {
     // Sort the matches found on the heuristic number that is after the
     // tag name.
@@ -5409,8 +5424,8 @@ void fix_help_buffer(void)
           // Note: We cannot just do `&NameBuff` because it is a statically sized array
           //       so `NameBuff == &NameBuff` according to C semantics.
           char *buff_list[1] = { (char *)NameBuff };
-          if (gen_expand_wildcards(1, (char_u **)buff_list, &fcount,
-                                   (char_u ***)&fnames, EW_FILE|EW_SILENT) == OK
+          if (gen_expand_wildcards(1, buff_list, &fcount,
+                                   &fnames, EW_FILE|EW_SILENT) == OK
               && fcount > 0) {
             // If foo.abx is found use it instead of foo.txt in
             // the same directory.
@@ -5511,7 +5526,7 @@ void fix_help_buffer(void)
               }
               fclose(fd);
             }
-            FreeWild(fcount, (char_u **)fnames);
+            FreeWild(fcount, fnames);
           }
         }
         xfree(rt);
@@ -5565,11 +5580,14 @@ static void helptags_one(char *dir, const char *ext, const char *tagfname, bool 
   // Note: We cannot just do `&NameBuff` because it is a statically sized array
   //       so `NameBuff == &NameBuff` according to C semantics.
   char *buff_list[1] = { (char *)NameBuff };
-  if (gen_expand_wildcards(1, (char_u **)buff_list, &filecount, (char_u ***)&files,
-                           EW_FILE|EW_SILENT) == FAIL
-      || filecount == 0) {
+  const int res = gen_expand_wildcards(1, buff_list, &filecount, &files,
+                                       EW_FILE|EW_SILENT);
+  if (res == FAIL || filecount == 0) {
     if (!got_int) {
       semsg(_("E151: No match: %s"), NameBuff);
+    }
+    if (res != FAIL) {
+      FreeWild(filecount, files);
     }
     return;
   }
@@ -5590,7 +5608,7 @@ static void helptags_one(char *dir, const char *ext, const char *tagfname, bool 
     if (!ignore_writeerr) {
       semsg(_("E152: Cannot open %s for writing"), NameBuff);
     }
-    FreeWild(filecount, (char_u **)files);
+    FreeWild(filecount, files);
     return;
   }
 
@@ -5680,11 +5698,11 @@ static void helptags_one(char *dir, const char *ext, const char *tagfname, bool 
     fclose(fd);
   }
 
-  FreeWild(filecount, (char_u **)files);
+  FreeWild(filecount, files);
 
   if (!got_int && ga.ga_data != NULL) {
     // Sort the tags.
-    sort_strings((char_u **)ga.ga_data, ga.ga_len);
+    sort_strings(ga.ga_data, ga.ga_len);
 
     // Check for duplicates.
     for (int i = 1; i < ga.ga_len; i++) {
@@ -5759,7 +5777,7 @@ static void do_helptags(char *dirname, bool add_help_tags, bool ignore_writeerr)
   // Note: We cannot just do `&NameBuff` because it is a statically sized array
   //       so `NameBuff == &NameBuff` according to C semantics.
   char *buff_list[1] = { (char *)NameBuff };
-  if (gen_expand_wildcards(1, (char_u **)buff_list, &filecount, (char_u ***)&files,
+  if (gen_expand_wildcards(1, buff_list, &filecount, &files,
                            EW_FILE|EW_SILENT) == FAIL
       || filecount == 0) {
     semsg(_("E151: No match: %s"), NameBuff);
@@ -5775,6 +5793,7 @@ static void do_helptags(char *dirname, bool add_help_tags, bool ignore_writeerr)
     if (len <= 4) {
       continue;
     }
+
     if (STRICMP(files[i] + len - 4, ".txt") == 0) {
       // ".txt" -> language "en"
       lang[0] = 'e';
@@ -5825,7 +5844,7 @@ static void do_helptags(char *dirname, bool add_help_tags, bool ignore_writeerr)
   }
 
   ga_clear(&ga);
-  FreeWild(filecount, (char_u **)files);
+  FreeWild(filecount, files);
 }
 
 static void helptags_cb(char *fname, void *cookie)

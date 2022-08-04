@@ -7,6 +7,7 @@
 
 #include "nvim/buffer_defs.h"
 #include "nvim/charset.h"
+#include "nvim/eval/funcs.h"
 #include "nvim/fold.h"
 #include "nvim/highlight_group.h"
 #include "nvim/match.h"
@@ -398,7 +399,7 @@ static void next_search_hl(win_T *win, match_T *search_hl, match_T *shl, linenr_
   linenr_T l;
   colnr_T matchcol;
   long nmatched = 0;
-  int save_called_emsg = called_emsg;
+  const int called_emsg_before = called_emsg;
 
   // for :{range}s/pat only highlight inside the range
   if (lnum < search_first_line || lnum > search_last_line) {
@@ -421,7 +422,6 @@ static void next_search_hl(win_T *win, match_T *search_hl, match_T *shl, linenr_
 
   // Repeat searching for a match until one is found that includes "mincol"
   // or none is found in this line.
-  called_emsg = false;
   for (;;) {
     // Stop searching after passing the time limit.
     if (profile_passed_limit(shl->tm)) {
@@ -468,7 +468,7 @@ static void next_search_hl(win_T *win, match_T *search_hl, match_T *shl, linenr_
       if (regprog_is_copy) {
         cur->match.regprog = cur->hl.rm.regprog;
       }
-      if (called_emsg || got_int || timed_out) {
+      if (called_emsg > called_emsg_before || got_int || timed_out) {
         // Error while handling regexp: stop using this regexp.
         if (shl == search_hl) {
           // don't free regprog in the match list, it's a copy
@@ -495,9 +495,6 @@ static void next_search_hl(win_T *win, match_T *search_hl, match_T *shl, linenr_
       break;                            // useful match found
     }
   }
-
-  // Restore called_emsg for assert_fails().
-  called_emsg = save_called_emsg;
 }
 
 /// Advance to the match in window "wp" line "lnum" or past it.

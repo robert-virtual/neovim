@@ -1597,7 +1597,7 @@ return {
       short_desc=N_("the use of mouse clicks"),
       type='string', list='flags', scope={'global'},
       varname='p_mouse',
-      defaults={if_true=""}
+      defaults={if_true="nvi"}
     },
     {
       full_name='mousefocus', abbreviation='mousef',
@@ -1619,7 +1619,7 @@ return {
       short_desc=N_("changes meaning of mouse buttons"),
       type='string', scope={'global'},
       varname='p_mousem',
-      defaults={if_true="extend"}
+      defaults={if_true="popup_setpos"}
     },
     {
       full_name='mousescroll',
@@ -2063,7 +2063,7 @@ return {
       type='string', list='onecomma', scope={'global'},
       deny_duplicates=true,
       varname='p_ssop',
-      defaults={if_true="blank,buffers,curdir,folds,help,tabpages,winsize"}
+      defaults={if_true="blank,buffers,curdir,folds,help,tabpages,winsize,terminal"}
     },
     {
       full_name='shada', abbreviation='sd',

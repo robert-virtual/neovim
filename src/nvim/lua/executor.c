@@ -15,6 +15,7 @@
 #include "nvim/buffer_defs.h"
 #include "nvim/change.h"
 #include "nvim/cursor.h"
+#include "nvim/eval/funcs.h"
 #include "nvim/eval/typval.h"
 #include "nvim/eval/userfunc.h"
 #include "nvim/event/loop.h"
@@ -416,9 +417,9 @@ static int nlua_wait(lua_State *lstate)
   LOOP_PROCESS_EVENTS_UNTIL(&main_loop,
                             loop_events,
                             (int)timeout,
-                            is_function ? nlua_wait_condition(lstate,
-                                                              &pcall_status,
-                                                              &callback_result) : false || got_int);
+                            got_int || (is_function ? nlua_wait_condition(lstate,
+                                                                          &pcall_status,
+                                                                          &callback_result) : false));
 
   // Stop dummy timer
   time_watcher_stop(tw);
@@ -1673,7 +1674,7 @@ static void nlua_add_treesitter(lua_State *const lstate) FUNC_ATTR_NONNULL_ALL
   lua_setfield(lstate, -2, "_ts_get_minimum_language_version");
 }
 
-int nlua_expand_pat(expand_T *xp, char_u *pat, int *num_results, char_u ***results)
+int nlua_expand_pat(expand_T *xp, char_u *pat, int *num_results, char ***results)
 {
   lua_State *const lstate = global_lstate;
   int ret = OK;
@@ -1685,7 +1686,7 @@ int nlua_expand_pat(expand_T *xp, char_u *pat, int *num_results, char_u ***resul
   lua_getfield(lstate, -1, "_expand_pat");
   luaL_checktype(lstate, -1, LUA_TFUNCTION);
 
-  // [ vim, vim._on_key, buf ]
+  // [ vim, vim._expand_pat, buf ]
   lua_pushlstring(lstate, (const char *)pat, STRLEN(pat));
 
   if (nlua_pcall(lstate, 1, 2) != 0) {
@@ -1838,7 +1839,7 @@ void nlua_execute_on_key(int c)
   // [ vim ]
   lua_getglobal(lstate, "vim");
 
-  // [ vim, vim._on_key]
+  // [ vim, vim._on_key ]
   lua_getfield(lstate, -1, "_on_key");
   luaL_checktype(lstate, -1, LUA_TFUNCTION);
 
@@ -2074,4 +2075,35 @@ int nlua_do_ucmd(ucmd_T *cmd, exarg_T *eap, bool preview)
   }
 
   return retv;
+}
+
+/// String representation of a Lua function reference
+///
+/// @return Allocated string
+char *nlua_funcref_str(LuaRef ref)
+{
+  lua_State *const lstate = global_lstate;
+  StringBuilder str = KV_INITIAL_VALUE;
+  kv_resize(str, 16);
+
+  if (!lua_checkstack(lstate, 1)) {
+    goto plain;
+  }
+  nlua_pushref(lstate, ref);
+  if (!lua_isfunction(lstate, -1)) {
+    lua_pop(lstate, 1);
+    goto plain;
+  }
+
+  lua_Debug ar;
+  if (lua_getinfo(lstate, ">S", &ar) && *ar.source == '@' && ar.linedefined >= 0) {
+    char *src = home_replace_save(NULL, ar.source + 1);
+    kv_printf(str, "<Lua %d: %s:%d>", ref, src, ar.linedefined);
+    xfree(src);
+    return str.items;
+  }
+
+plain:
+  kv_printf(str, "<Lua %d>", ref);
+  return str.items;
 }

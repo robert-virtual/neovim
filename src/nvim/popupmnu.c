@@ -16,6 +16,7 @@
 #include "nvim/edit.h"
 #include "nvim/eval/typval.h"
 #include "nvim/ex_cmds.h"
+#include "nvim/insexpand.h"
 #include "nvim/memline.h"
 #include "nvim/memory.h"
 #include "nvim/menu.h"
@@ -726,8 +727,7 @@ static int pum_set_selected(int n, int repeat)
         if (!resized
             && (curbuf->b_nwindows == 1)
             && (curbuf->b_fname == NULL)
-            && (curbuf->b_p_bt[0] == 'n')
-            && (curbuf->b_p_bt[2] == 'f')
+            && bt_nofile(curbuf)
             && (curbuf->b_p_bh[0] == 'w')) {
           // Already a "wipeout" buffer, make it empty.
           while (!buf_is_empty(curbuf)) {
@@ -977,7 +977,7 @@ static void pum_select_mouse_pos(void)
   if (mouse_grid == pum_grid.handle) {
     pum_selected = mouse_row;
     return;
-  } else if (mouse_grid > 1) {
+  } else if (mouse_grid != pum_anchor_grid) {
     pum_selected = -1;
     return;
   }
@@ -1054,7 +1054,10 @@ void pum_show_popupmenu(vimmenu_T *menu)
     ui_flush();
 
     int c = vgetc();
-    if (c == ESC || c == Ctrl_C) {
+
+    // Bail out when typing Esc, CTRL-C or some callback or <expr> mapping
+    // closed the popup menu.
+    if (c == ESC || c == Ctrl_C || pum_array == NULL) {
       break;
     } else if (c == CAR || c == NL) {
       // enter: select current item, if any, and close

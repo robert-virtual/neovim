@@ -372,14 +372,15 @@ local function schedule_display(namespace, bufnr, args)
   bufs_waiting_to_update[bufnr][namespace] = args
 
   local key = make_augroup_key(namespace, bufnr)
-  local group = vim.api.nvim_create_augroup(key, { clear = true })
   if not registered_autocmds[key] then
+    local group = vim.api.nvim_create_augroup(key, { clear = true })
     vim.api.nvim_create_autocmd(insert_leave_auto_cmds, {
       group = group,
       buffer = bufnr,
       callback = function()
         execute_scheduled_display(namespace, bufnr)
       end,
+      desc = 'vim.diagnostic: display diagnostics',
     })
     registered_autocmds[key] = true
   end
@@ -585,12 +586,12 @@ end
 ---
 --- For example, if a user enables virtual text globally with
 --- <pre>
----   vim.diagnostic.config({virtual_text = true})
+---   vim.diagnostic.config({ virtual_text = true })
 --- </pre>
 ---
 --- and a diagnostic producer sets diagnostics with
 --- <pre>
----   vim.diagnostic.set(ns, 0, diagnostics, {virtual_text = false})
+---   vim.diagnostic.set(ns, 0, diagnostics, { virtual_text = false })
 --- </pre>
 ---
 --- then virtual text will not be enabled for those diagnostics.
@@ -1524,8 +1525,8 @@ end
 --- <pre>
 --- local s = "WARNING filename:27:3: Variable 'foo' does not exist"
 --- local pattern = "^(%w+) %w+:(%d+):(%d+): (.+)$"
---- local groups = {"severity", "lnum", "col", "message"}
---- vim.diagnostic.match(s, pattern, groups, {WARNING = vim.diagnostic.WARN})
+--- local groups = { "severity", "lnum", "col", "message" }
+--- vim.diagnostic.match(s, pattern, groups, { WARNING = vim.diagnostic.WARN })
 --- </pre>
 ---
 ---@param str string String to parse diagnostics from.

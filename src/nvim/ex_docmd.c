@@ -21,6 +21,7 @@
 #include "nvim/edit.h"
 #include "nvim/eval.h"
 #include "nvim/eval/userfunc.h"
+#include "nvim/eval/vars.h"
 #include "nvim/event/rstream.h"
 #include "nvim/event/wstream.h"
 #include "nvim/ex_cmds.h"
@@ -227,6 +228,8 @@ void do_exmode(void)
         emsg(_(e_emptybuf));
       } else {
         if (ex_pressedreturn) {
+          // Make sure the message overwrites the right line and isn't throttled.
+          msg_scroll_flush();
           // go up one line, to overwrite the ":<CR>" line, so the
           // output doesn't contain empty lines.
           msg_row = prev_msg_row;
@@ -908,6 +911,15 @@ int do_cmdline(char *cmdline, LineGetter fgetline, void *cookie, int flags)
 
   msg_list = saved_msg_list;
 
+  // Cleanup if "cs_emsg_silent_list" remains.
+  if (cstack.cs_emsg_silent_list != NULL) {
+    eslist_T *elem, *temp;
+    for (elem = cstack.cs_emsg_silent_list; elem != NULL; elem = temp) {
+      temp = elem->next;
+      xfree(elem);
+    }
+  }
+
   /*
    * If there was too much output to fit on the command line, ask the user to
    * hit return before redrawing the screen. With the ":global" command we do
@@ -1384,7 +1396,7 @@ static int parse_count(exarg_T *eap, char **errormsg, bool validate)
   if ((eap->argt & EX_COUNT) && ascii_isdigit(*eap->arg)
       && (!(eap->argt & EX_BUFNAME) || *(p = skipdigits(eap->arg + 1)) == NUL
           || ascii_iswhite(*p))) {
-    n = getdigits_long((char_u **)&eap->arg, false, -1);
+    n = getdigits_long(&eap->arg, false, -1);
     eap->arg = skipwhite(eap->arg);
     if (n <= 0 && (eap->argt & EX_ZEROR) == 0) {
       if (errormsg != NULL) {
@@ -1433,10 +1445,13 @@ bool parse_cmdline(char *cmdline, exarg_T *eap, CmdParseInfo *cmdinfo, char **er
   eap->getline = NULL;
   eap->cookie = NULL;
 
+  const bool save_ex_pressedreturn = ex_pressedreturn;
   // Parse command modifiers
   if (parse_command_modifiers(eap, errormsg, &cmdinfo->cmdmod, false) == FAIL) {
+    ex_pressedreturn = save_ex_pressedreturn;
     goto err;
   }
+  ex_pressedreturn = save_ex_pressedreturn;
   after_modifier = eap->cmd;
 
   // Save location after command modifiers
@@ -1548,63 +1563,12 @@ err:
   return false;
 }
 
-/// Execute an Ex command using parsed command line information.
-/// Does not do any validation of the Ex command arguments.
-///
-/// @param eap Ex-command arguments
-/// @param cmdinfo Command parse information
-/// @param preview Execute command preview callback instead of actual command
-int execute_cmd(exarg_T *eap, CmdParseInfo *cmdinfo, bool preview)
+static int execute_cmd0(int *retv, exarg_T *eap, char **errormsg, bool preview)
 {
-  char *errormsg = NULL;
-  int retv = 0;
-
-#define ERROR(msg) \
-  do { \
-    errormsg = msg; \
-    goto end; \
-  } while (0)
-
-  cmdmod_T save_cmdmod = cmdmod;
-  cmdmod = cmdinfo->cmdmod;
-
-  // Apply command modifiers
-  apply_cmdmod(&cmdmod);
-
-  if (!MODIFIABLE(curbuf) && (eap->argt & EX_MODIFY)
-      // allow :put in terminals
-      && !(curbuf->terminal && eap->cmdidx == CMD_put)) {
-    ERROR(_(e_modifiable));
-  }
-  if (text_locked() && !(eap->argt & EX_CMDWIN)
-      && !IS_USER_CMDIDX(eap->cmdidx)) {
-    ERROR(_(get_text_locked_msg()));
-  }
-  // Disallow editing another buffer when "curbuf->b_ro_locked" is set.
-  // Do allow ":checktime" (it is postponed).
-  // Do allow ":edit" (check for an argument later).
-  // Do allow ":file" with no arguments
-  if (!(eap->argt & EX_CMDWIN)
-      && eap->cmdidx != CMD_checktime
-      && eap->cmdidx != CMD_edit
-      && !(eap->cmdidx == CMD_file && *eap->arg == NUL)
-      && !IS_USER_CMDIDX(eap->cmdidx)
-      && curbuf_locked()) {
-    ERROR(_(e_cannot_edit_other_buf));
-  }
-
-  if (((eap->argt & EX_WHOLEFOLD) || eap->addr_count >= 2) && !global_busy
-      && eap->addr_type == ADDR_LINES) {
-    // Put the first line at the start of a closed fold, put the last line
-    // at the end of a closed fold.
-    (void)hasFolding(eap->line1, &eap->line1, NULL);
-    (void)hasFolding(eap->line2, NULL, &eap->line2);
-  }
-
   // If filename expansion is enabled, expand filenames
-  if (cmdinfo->magic.file) {
-    if (expand_filename(eap, (char_u **)eap->cmdlinep, &errormsg) == FAIL) {
-      goto end;
+  if (eap->argt & EX_XFILE) {
+    if (expand_filename(eap, eap->cmdlinep, errormsg) == FAIL) {
+      return FAIL;
     }
   }
 
@@ -1649,28 +1613,103 @@ int execute_cmd(exarg_T *eap, CmdParseInfo *cmdinfo, bool preview)
       eap->arg = eap->args[0];
     }
     if (eap->line2 < 0) {  // failed
-      goto end;
+      return FAIL;
     }
+  }
+
+  // The :try command saves the emsg_silent flag, reset it here when
+  // ":silent! try" was used, it should only apply to :try itself.
+  if (eap->cmdidx == CMD_try && cmdmod.cmod_did_esilent > 0) {
+    emsg_silent -= cmdmod.cmod_did_esilent;
+    if (emsg_silent < 0) {
+      emsg_silent = 0;
+    }
+    cmdmod.cmod_did_esilent = 0;
   }
 
   // Execute the command
   if (IS_USER_CMDIDX(eap->cmdidx)) {
     // Execute a user-defined command.
-    retv = do_ucmd(eap, preview);
+    *retv = do_ucmd(eap, preview);
   } else {
     // Call the function to execute the command or the preview callback.
     eap->errmsg = NULL;
 
     if (preview) {
-      retv = (cmdnames[eap->cmdidx].cmd_preview_func)(eap, cmdpreview_get_ns(),
-                                                      cmdpreview_get_bufnr());
+      *retv = (cmdnames[eap->cmdidx].cmd_preview_func)(eap, cmdpreview_get_ns(),
+                                                       cmdpreview_get_bufnr());
     } else {
       (cmdnames[eap->cmdidx].cmd_func)(eap);
     }
     if (eap->errmsg != NULL) {
-      errormsg = _(eap->errmsg);
+      *errormsg = _(eap->errmsg);
     }
   }
+
+  return OK;
+}
+
+/// Execute an Ex command using parsed command line information.
+/// Does not do any validation of the Ex command arguments.
+///
+/// @param eap Ex-command arguments
+/// @param cmdinfo Command parse information
+/// @param preview Execute command preview callback instead of actual command
+int execute_cmd(exarg_T *eap, CmdParseInfo *cmdinfo, bool preview)
+{
+  char *errormsg = NULL;
+  int retv = 0;
+
+#define ERROR(msg) \
+  do { \
+    errormsg = msg; \
+    goto end; \
+  } while (0)
+
+  cmdmod_T save_cmdmod = cmdmod;
+  cmdmod = cmdinfo->cmdmod;
+
+  // Apply command modifiers
+  apply_cmdmod(&cmdmod);
+
+  if (!MODIFIABLE(curbuf) && (eap->argt & EX_MODIFY)
+      // allow :put in terminals
+      && !(curbuf->terminal && eap->cmdidx == CMD_put)) {
+    ERROR(_(e_modifiable));
+  }
+  if (!IS_USER_CMDIDX(eap->cmdidx)) {
+    if (cmdwin_type != 0 && !(eap->argt & EX_CMDWIN)) {
+      // Command not allowed in the command line window
+      ERROR(_(e_cmdwin));
+    }
+    if (text_locked() && !(eap->argt & EX_LOCK_OK)) {
+      // Command not allowed when text is locked
+      ERROR(_(get_text_locked_msg()));
+    }
+  }
+  // Disallow editing another buffer when "curbuf->b_ro_locked" is set.
+  // Do allow ":checktime" (it is postponed).
+  // Do allow ":edit" (check for an argument later).
+  // Do allow ":file" with no arguments
+  if (!(eap->argt & EX_CMDWIN)
+      && eap->cmdidx != CMD_checktime
+      && eap->cmdidx != CMD_edit
+      && !(eap->cmdidx == CMD_file && *eap->arg == NUL)
+      && !IS_USER_CMDIDX(eap->cmdidx)
+      && curbuf_locked()) {
+    ERROR(_(e_cannot_edit_other_buf));
+  }
+
+  if (((eap->argt & EX_WHOLEFOLD) || eap->addr_count >= 2) && !global_busy
+      && eap->addr_type == ADDR_LINES) {
+    // Put the first line at the start of a closed fold, put the last line
+    // at the end of a closed fold.
+    (void)hasFolding(eap->line1, &eap->line1, NULL);
+    (void)hasFolding(eap->line2, NULL, &eap->line2);
+  }
+
+  // Execute the command
+  execute_cmd0(&retv, eap, &errormsg, preview);
 
 end:
   if (errormsg != NULL && *errormsg != NUL) {
@@ -1683,117 +1722,30 @@ end:
 #undef ERROR
 }
 
-/// Execute one Ex command.
-///
-/// If 'sourcing' is TRUE, the command will be included in the error message.
-///
-/// 1. skip comment lines and leading space
-/// 2. handle command modifiers
-/// 3. skip over the range to find the command
-/// 4. parse the range
-/// 5. parse the command
-/// 6. parse arguments
-/// 7. switch on command name
-///
-/// Note: "fgetline" can be NULL.
-///
-/// This function may be called recursively!
-///
-/// @param cookie  argument for fgetline()
-static char *do_one_cmd(char **cmdlinep, int flags, cstack_T *cstack, LineGetter fgetline,
-                        void *cookie)
+static void profile_cmd(const exarg_T *eap, cstack_T *cstack, LineGetter fgetline, void *cookie)
 {
-  char *p;
-  linenr_T lnum;
-  char *errormsg = NULL;  // error message
-  char *after_modifier = NULL;
-  exarg_T ea;
-  cmdmod_T save_cmdmod;
-  const int save_reg_executing = reg_executing;
-  const bool save_pending_end_reg_executing = pending_end_reg_executing;
-  char *cmd;
-
-  memset(&ea, 0, sizeof(ea));
-  ea.line1 = 1;
-  ea.line2 = 1;
-  ex_nesting_level++;
-
-  // When the last file has not been edited :q has to be typed twice.
-  if (quitmore
-      // avoid that a function call in 'statusline' does this
-      && !getline_equal(fgetline, cookie, get_func_line)
-      // avoid that an autocommand, e.g. QuitPre, does this
-      && !getline_equal(fgetline, cookie,
-                        getnextac)) {
-    --quitmore;
-  }
-
-  /*
-   * Reset browse, confirm, etc..  They are restored when returning, for
-   * recursive calls.
-   */
-  save_cmdmod = cmdmod;
-
-  // "#!anything" is handled like a comment.
-  if ((*cmdlinep)[0] == '#' && (*cmdlinep)[1] == '!') {
-    goto doend;
-  }
-
-  // 1. Skip comment lines and leading white space and colons.
-  // 2. Handle command modifiers.
-
-  // The "ea" structure holds the arguments that can be used.
-  ea.cmd = *cmdlinep;
-  ea.cmdlinep = cmdlinep;
-  ea.getline = fgetline;
-  ea.cookie = cookie;
-  ea.cstack = cstack;
-
-  if (parse_command_modifiers(&ea, &errormsg, &cmdmod, false) == FAIL) {
-    goto doend;
-  }
-  apply_cmdmod(&cmdmod);
-
-  after_modifier = ea.cmd;
-
-  ea.skip = (did_emsg
-             || got_int
-             || current_exception
-             || (cstack->cs_idx >= 0
-                 && !(cstack->cs_flags[cstack->cs_idx] & CSF_ACTIVE)));
-
-  // 3. Skip over the range to find the command. Let "p" point to after it.
-  //
-  // We need the command to know what kind of range it uses.
-  cmd = ea.cmd;
-  ea.cmd = skip_range(ea.cmd, NULL);
-  if (*ea.cmd == '*') {
-    ea.cmd = skipwhite(ea.cmd + 1);
-  }
-  p = find_ex_command(&ea, NULL);
-
   // Count this line for profiling if skip is TRUE.
   if (do_profiling == PROF_YES
-      && (!ea.skip || cstack->cs_idx == 0
+      && (!eap->skip || cstack->cs_idx == 0
           || (cstack->cs_idx > 0
               && (cstack->cs_flags[cstack->cs_idx - 1] & CSF_ACTIVE)))) {
     int skip = did_emsg || got_int || current_exception;
 
-    if (ea.cmdidx == CMD_catch) {
+    if (eap->cmdidx == CMD_catch) {
       skip = !skip && !(cstack->cs_idx >= 0
                         && (cstack->cs_flags[cstack->cs_idx] & CSF_THROWN)
                         && !(cstack->cs_flags[cstack->cs_idx] & CSF_CAUGHT));
-    } else if (ea.cmdidx == CMD_else || ea.cmdidx == CMD_elseif) {
+    } else if (eap->cmdidx == CMD_else || eap->cmdidx == CMD_elseif) {
       skip = skip || !(cstack->cs_idx >= 0
                        && !(cstack->cs_flags[cstack->cs_idx]
                             & (CSF_ACTIVE | CSF_TRUE)));
-    } else if (ea.cmdidx == CMD_finally) {
+    } else if (eap->cmdidx == CMD_finally) {
       skip = false;
-    } else if (ea.cmdidx != CMD_endif
-               && ea.cmdidx != CMD_endfor
-               && ea.cmdidx != CMD_endtry
-               && ea.cmdidx != CMD_endwhile) {
-      skip = ea.skip;
+    } else if (eap->cmdidx != CMD_endif
+               && eap->cmdidx != CMD_endfor
+               && eap->cmdidx != CMD_endtry
+               && eap->cmdidx != CMD_endwhile) {
+      skip = eap->skip;
     }
 
     if (!skip) {
@@ -1804,374 +1756,16 @@ static char *do_one_cmd(char **cmdlinep, int flags, cstack_T *cstack, LineGetter
       }
     }
   }
+}
 
-  // May go to debug mode.  If this happens and the ">quit" debug command is
-  // used, throw an interrupt exception and skip the next command.
-  dbg_check_breakpoint(&ea);
-  if (!ea.skip && got_int) {
-    ea.skip = TRUE;
-    (void)do_intthrow(cstack);
-  }
-
-  // 4. Parse a range specifier of the form: addr [,addr] [;addr] ..
-  //
-  // where 'addr' is:
-  //
-  // %          (entire file)
-  // $  [+-NUM]
-  // 'x [+-NUM] (where x denotes a currently defined mark)
-  // .  [+-NUM]
-  // [+-NUM]..
-  // NUM
-  //
-  // The ea.cmd pointer is updated to point to the first character following the
-  // range spec. If an initial address is found, but no second, the upper bound
-  // is equal to the lower.
-  set_cmd_addr_type(&ea, p);
-
-  ea.cmd = cmd;
-  if (parse_cmd_address(&ea, &errormsg, false) == FAIL) {
-    goto doend;
-  }
-
-  /*
-   * 5. Parse the command.
-   */
-
-  /*
-   * Skip ':' and any white space
-   */
-  ea.cmd = skip_colon_white(ea.cmd, true);
-
-  /*
-   * If we got a line, but no command, then go to the line.
-   * If we find a '|' or '\n' we set ea.nextcmd.
-   */
-  if (*ea.cmd == NUL || *ea.cmd == '"'
-      || (ea.nextcmd = (char *)check_nextcmd((char_u *)ea.cmd)) != NULL) {
-    // strange vi behaviour:
-    // ":3"     jumps to line 3
-    // ":3|..." prints line 3
-    // ":|"     prints current line
-    if (ea.skip) {  // skip this if inside :if
-      goto doend;
-    }
-    if (*ea.cmd == '|' || (exmode_active && ea.line1 != ea.line2)) {
-      ea.cmdidx = CMD_print;
-      ea.argt = EX_RANGE | EX_COUNT | EX_TRLBAR;
-      if ((errormsg = invalid_range(&ea)) == NULL) {
-        correct_range(&ea);
-        ex_print(&ea);
-      }
-    } else if (ea.addr_count != 0) {
-      if (ea.line2 > curbuf->b_ml.ml_line_count) {
-        ea.line2 = curbuf->b_ml.ml_line_count;
-      }
-
-      if (ea.line2 < 0) {
-        errormsg = _(e_invrange);
-      } else {
-        if (ea.line2 == 0) {
-          curwin->w_cursor.lnum = 1;
-        } else {
-          curwin->w_cursor.lnum = ea.line2;
-        }
-        beginline(BL_SOL | BL_FIX);
-      }
-    }
-    goto doend;
-  }
-
-  // If this looks like an undefined user command and there are CmdUndefined
-  // autocommands defined, trigger the matching autocommands.
-  if (p != NULL && ea.cmdidx == CMD_SIZE && !ea.skip
-      && ASCII_ISUPPER(*ea.cmd)
-      && has_event(EVENT_CMDUNDEFINED)) {
-    p = ea.cmd;
-    while (ASCII_ISALNUM(*p)) {
-      ++p;
-    }
-    p = xstrnsave(ea.cmd, (size_t)(p - ea.cmd));
-    int ret = apply_autocmds(EVENT_CMDUNDEFINED, p, p, true, NULL);
-    xfree(p);
-    // If the autocommands did something and didn't cause an error, try
-    // finding the command again.
-    p = (ret && !aborting()) ? find_ex_command(&ea, NULL) : ea.cmd;
-  }
-
-  if (p == NULL) {
-    if (!ea.skip) {
-      errormsg = _(e_ambiguous_use_of_user_defined_command);
-    }
-    goto doend;
-  }
-  // Check for wrong commands.
-  if (ea.cmdidx == CMD_SIZE) {
-    if (!ea.skip) {
-      STRCPY(IObuff, _(e_not_an_editor_command));
-      // If the modifier was parsed OK the error must be in the following
-      // command
-      char *cmdname = after_modifier ? after_modifier : *cmdlinep;
-      if (!(flags & DOCMD_VERBOSE)) {
-        append_command(cmdname);
-      }
-      errormsg = (char *)IObuff;
-      did_emsg_syntax = true;
-      verify_command(cmdname);
-    }
-    goto doend;
-  }
-
-  // set when Not Implemented
-  const int ni = is_cmd_ni(ea.cmdidx);
-
-  // Forced commands.
-  if (*p == '!' && ea.cmdidx != CMD_substitute
-      && ea.cmdidx != CMD_smagic && ea.cmdidx != CMD_snomagic) {
-    p++;
-    ea.forceit = true;
-  } else {
-    ea.forceit = false;
-  }
-
-  // 6. Parse arguments.  Then check for errors.
-  if (!IS_USER_CMDIDX(ea.cmdidx)) {
-    ea.argt = cmdnames[(int)ea.cmdidx].cmd_argt;
-  }
-
-  if (!ea.skip) {
-    if (sandbox != 0 && !(ea.argt & EX_SBOXOK)) {
-      // Command not allowed in sandbox.
-      errormsg = _(e_sandbox);
-      goto doend;
-    }
-    if (!MODIFIABLE(curbuf) && (ea.argt & EX_MODIFY)
-        // allow :put in terminals
-        && (!curbuf->terminal || ea.cmdidx != CMD_put)) {
-      // Command not allowed in non-'modifiable' buffer
-      errormsg = _(e_modifiable);
-      goto doend;
-    }
-
-    if (text_locked() && !(ea.argt & EX_CMDWIN)
-        && !IS_USER_CMDIDX(ea.cmdidx)) {
-      // Command not allowed when editing the command line.
-      errormsg = _(get_text_locked_msg());
-      goto doend;
-    }
-
-    // Disallow editing another buffer when "curbuf->b_ro_locked" is set.
-    // Do allow ":checktime" (it is postponed).
-    // Do allow ":edit" (check for an argument later).
-    // Do allow ":file" with no arguments (check for an argument later).
-    if (!(ea.argt & EX_CMDWIN)
-        && ea.cmdidx != CMD_checktime
-        && ea.cmdidx != CMD_edit
-        && ea.cmdidx != CMD_file
-        && !IS_USER_CMDIDX(ea.cmdidx)
-        && curbuf_locked()) {
-      goto doend;
-    }
-
-    if (!ni && !(ea.argt & EX_RANGE) && ea.addr_count > 0) {
-      // no range allowed
-      errormsg = _(e_norange);
-      goto doend;
-    }
-  }
-
-  if (!ni && !(ea.argt & EX_BANG) && ea.forceit) {  // no <!> allowed
-    errormsg = _(e_nobang);
-    goto doend;
-  }
-
-  /*
-   * Don't complain about the range if it is not used
-   * (could happen if line_count is accidentally set to 0).
-   */
-  if (!ea.skip && !ni && (ea.argt & EX_RANGE)) {
-    // If the range is backwards, ask for confirmation and, if given, swap
-    // ea.line1 & ea.line2 so it's forwards again.
-    // When global command is busy, don't ask, will fail below.
-    if (!global_busy && ea.line1 > ea.line2) {
-      if (msg_silent == 0) {
-        if ((flags & DOCMD_VERBOSE) || exmode_active) {
-          errormsg = _("E493: Backwards range given");
-          goto doend;
-        }
-        if (ask_yesno(_("Backwards range given, OK to swap"), false) != 'y') {
-          goto doend;
-        }
-      }
-      lnum = ea.line1;
-      ea.line1 = ea.line2;
-      ea.line2 = lnum;
-    }
-    if ((errormsg = invalid_range(&ea)) != NULL) {
-      goto doend;
-    }
-  }
-
-  if ((ea.addr_type == ADDR_OTHER) && ea.addr_count == 0) {
-    // default is 1, not cursor
-    ea.line2 = 1;
-  }
-
-  correct_range(&ea);
-
-  if (((ea.argt & EX_WHOLEFOLD) || ea.addr_count >= 2) && !global_busy
-      && ea.addr_type == ADDR_LINES) {
-    // Put the first line at the start of a closed fold, put the last line
-    // at the end of a closed fold.
-    (void)hasFolding(ea.line1, &ea.line1, NULL);
-    (void)hasFolding(ea.line2, NULL, &ea.line2);
-  }
-
-  /*
-   * For the ":make" and ":grep" commands we insert the 'makeprg'/'grepprg'
-   * option here, so things like % get expanded.
-   */
-  p = replace_makeprg(&ea, p, cmdlinep);
-  if (p == NULL) {
-    goto doend;
-  }
-
-  /*
-   * Skip to start of argument.
-   * Don't do this for the ":!" command, because ":!! -l" needs the space.
-   */
-  if (ea.cmdidx == CMD_bang) {
-    ea.arg = p;
-  } else {
-    ea.arg = skipwhite(p);
-  }
-
-  // ":file" cannot be run with an argument when "curbuf->b_ro_locked" is set
-  if (ea.cmdidx == CMD_file && *ea.arg != NUL && curbuf_locked()) {
-    goto doend;
-  }
-
-  /*
-   * Check for "++opt=val" argument.
-   * Must be first, allow ":w ++enc=utf8 !cmd"
-   */
-  if (ea.argt & EX_ARGOPT) {
-    while (ea.arg[0] == '+' && ea.arg[1] == '+') {
-      if (getargopt(&ea) == FAIL && !ni) {
-        errormsg = _(e_invarg);
-        goto doend;
-      }
-    }
-  }
-
-  if (ea.cmdidx == CMD_write || ea.cmdidx == CMD_update) {
-    if (*ea.arg == '>') {                       // append
-      if (*++ea.arg != '>') {                   // typed wrong
-        errormsg = _("E494: Use w or w>>");
-        goto doend;
-      }
-      ea.arg = skipwhite(ea.arg + 1);
-      ea.append = true;
-    } else if (*ea.arg == '!' && ea.cmdidx == CMD_write) {  // :w !filter
-      ++ea.arg;
-      ea.usefilter = TRUE;
-    }
-  }
-
-  if (ea.cmdidx == CMD_read) {
-    if (ea.forceit) {
-      ea.usefilter = TRUE;                      // :r! filter if ea.forceit
-      ea.forceit = FALSE;
-    } else if (*ea.arg == '!') {              // :r !filter
-      ++ea.arg;
-      ea.usefilter = TRUE;
-    }
-  }
-
-  if (ea.cmdidx == CMD_lshift || ea.cmdidx == CMD_rshift) {
-    ea.amount = 1;
-    while (*ea.arg == *ea.cmd) {                // count number of '>' or '<'
-      ea.arg++;
-      ea.amount++;
-    }
-    ea.arg = skipwhite(ea.arg);
-  }
-
-  /*
-   * Check for "+command" argument, before checking for next command.
-   * Don't do this for ":read !cmd" and ":write !cmd".
-   */
-  if ((ea.argt & EX_CMDARG) && !ea.usefilter) {
-    ea.do_ecmd_cmd = getargcmd(&ea.arg);
-  }
-
-  /*
-   * Check for '|' to separate commands and '"' to start comments.
-   * Don't do this for ":read !cmd" and ":write !cmd".
-   */
-  if ((ea.argt & EX_TRLBAR) && !ea.usefilter) {
-    separate_nextcmd(&ea);
-  } else if (ea.cmdidx == CMD_bang
-             || ea.cmdidx == CMD_terminal
-             || ea.cmdidx == CMD_global
-             || ea.cmdidx == CMD_vglobal
-             || ea.usefilter) {
-    // Check for <newline> to end a shell command.
-    // Also do this for ":read !cmd", ":write !cmd" and ":global".
-    // Any others?
-    for (p = ea.arg; *p; p++) {
-      // Remove one backslash before a newline, so that it's possible to
-      // pass a newline to the shell and also a newline that is preceded
-      // with a backslash.  This makes it impossible to end a shell
-      // command in a backslash, but that doesn't appear useful.
-      // Halving the number of backslashes is incompatible with previous
-      // versions.
-      if (*p == '\\' && p[1] == '\n') {
-        STRMOVE(p, p + 1);
-      } else if (*p == '\n') {
-        ea.nextcmd = p + 1;
-        *p = NUL;
-        break;
-      }
-    }
-  }
-
-  if ((ea.argt & EX_DFLALL) && ea.addr_count == 0) {
-    set_cmd_dflall_range(&ea);
-  }
-
-  // Parse register and count
-  parse_register(&ea);
-  if (parse_count(&ea, &errormsg, true) == FAIL) {
-    goto doend;
-  }
-
-  /*
-   * Check for flags: 'l', 'p' and '#'.
-   */
-  if (ea.argt & EX_FLAGS) {
-    get_flags(&ea);
-  }
-  if (!ni && !(ea.argt & EX_EXTRA) && *ea.arg != NUL
-      && *ea.arg != '"' && (*ea.arg != '|' || (ea.argt & EX_TRLBAR) == 0)) {
-    // no arguments allowed but there is something
-    errormsg = _(e_trailing);
-    goto doend;
-  }
-
-  if (!ni && (ea.argt & EX_NEEDARG) && *ea.arg == NUL) {
-    errormsg = _(e_argreq);
-    goto doend;
-  }
-
-  /*
-   * Skip the command when it's not going to be executed.
-   * The commands like :if, :endif, etc. always need to be executed.
-   * Also make an exception for commands that handle a trailing command
-   * themselves.
-   */
-  if (ea.skip) {
-    switch (ea.cmdidx) {
+static bool skip_cmd(const exarg_T *eap)
+{
+  // Skip the command when it's not going to be executed.
+  // The commands like :if, :endif, etc. always need to be executed.
+  // Also make an exception for commands that handle a trailing command
+  // themselves.
+  if (eap->skip) {
+    switch (eap->cmdidx) {
     // commands that need evaluation
     case CMD_while:
     case CMD_endwhile:
@@ -2258,79 +1852,448 @@ static char *do_one_cmd(char **cmdlinep, int flags, cstack_T *cstack, LineGetter
       break;
 
     default:
-      goto doend;
+      return true;
     }
   }
+  return false;
+}
 
-  if (ea.argt & EX_XFILE) {
-    if (expand_filename(&ea, (char_u **)cmdlinep, &errormsg) == FAIL) {
-      goto doend;
-    }
+/// Execute one Ex command.
+///
+/// If 'sourcing' is TRUE, the command will be included in the error message.
+///
+/// 1. skip comment lines and leading space
+/// 2. handle command modifiers
+/// 3. skip over the range to find the command
+/// 4. parse the range
+/// 5. parse the command
+/// 6. parse arguments
+/// 7. switch on command name
+///
+/// Note: "fgetline" can be NULL.
+///
+/// This function may be called recursively!
+///
+/// @param cookie  argument for fgetline()
+static char *do_one_cmd(char **cmdlinep, int flags, cstack_T *cstack, LineGetter fgetline,
+                        void *cookie)
+{
+  char *errormsg = NULL;  // error message
+  const int save_reg_executing = reg_executing;
+  const bool save_pending_end_reg_executing = pending_end_reg_executing;
+
+  exarg_T ea;
+  memset(&ea, 0, sizeof(ea));
+  ea.line1 = 1;
+  ea.line2 = 1;
+  ex_nesting_level++;
+
+  // When the last file has not been edited :q has to be typed twice.
+  if (quitmore
+      // avoid that a function call in 'statusline' does this
+      && !getline_equal(fgetline, cookie, get_func_line)
+      // avoid that an autocommand, e.g. QuitPre, does this
+      && !getline_equal(fgetline, cookie,
+                        getnextac)) {
+    --quitmore;
   }
 
-  /*
-   * Accept buffer name.  Cannot be used at the same time with a buffer
-   * number.  Don't do this for a user command.
-   */
-  if ((ea.argt & EX_BUFNAME) && *ea.arg != NUL && ea.addr_count == 0
-      && !IS_USER_CMDIDX(ea.cmdidx)) {
-    /*
-     * :bdelete, :bwipeout and :bunload take several arguments, separated
-     * by spaces: find next space (skipping over escaped characters).
-     * The others take one argument: ignore trailing spaces.
-     */
-    if (ea.cmdidx == CMD_bdelete || ea.cmdidx == CMD_bwipeout
-        || ea.cmdidx == CMD_bunload) {
-      p = skiptowhite_esc(ea.arg);
-    } else {
-      p = ea.arg + STRLEN(ea.arg);
-      while (p > ea.arg && ascii_iswhite(p[-1])) {
-        p--;
+  // Reset browse, confirm, etc..  They are restored when returning, for
+  // recursive calls.
+  cmdmod_T save_cmdmod = cmdmod;
+
+  // "#!anything" is handled like a comment.
+  if ((*cmdlinep)[0] == '#' && (*cmdlinep)[1] == '!') {
+    goto doend;
+  }
+
+  // 1. Skip comment lines and leading white space and colons.
+  // 2. Handle command modifiers.
+
+  // The "ea" structure holds the arguments that can be used.
+  ea.cmd = *cmdlinep;
+  ea.cmdlinep = cmdlinep;
+  ea.getline = fgetline;
+  ea.cookie = cookie;
+  ea.cstack = cstack;
+
+  if (parse_command_modifiers(&ea, &errormsg, &cmdmod, false) == FAIL) {
+    goto doend;
+  }
+  apply_cmdmod(&cmdmod);
+
+  char *after_modifier = ea.cmd;
+
+  ea.skip = (did_emsg
+             || got_int
+             || current_exception
+             || (cstack->cs_idx >= 0
+                 && !(cstack->cs_flags[cstack->cs_idx] & CSF_ACTIVE)));
+
+  // 3. Skip over the range to find the command. Let "p" point to after it.
+  //
+  // We need the command to know what kind of range it uses.
+  char *cmd = ea.cmd;
+  ea.cmd = skip_range(ea.cmd, NULL);
+  if (*ea.cmd == '*') {
+    ea.cmd = skipwhite(ea.cmd + 1);
+  }
+  char *p = find_ex_command(&ea, NULL);
+
+  profile_cmd(&ea, cstack, fgetline, cookie);
+
+  // May go to debug mode.  If this happens and the ">quit" debug command is
+  // used, throw an interrupt exception and skip the next command.
+  dbg_check_breakpoint(&ea);
+  if (!ea.skip && got_int) {
+    ea.skip = TRUE;
+    (void)do_intthrow(cstack);
+  }
+
+  // 4. Parse a range specifier of the form: addr [,addr] [;addr] ..
+  //
+  // where 'addr' is:
+  //
+  // %          (entire file)
+  // $  [+-NUM]
+  // 'x [+-NUM] (where x denotes a currently defined mark)
+  // .  [+-NUM]
+  // [+-NUM]..
+  // NUM
+  //
+  // The ea.cmd pointer is updated to point to the first character following the
+  // range spec. If an initial address is found, but no second, the upper bound
+  // is equal to the lower.
+  set_cmd_addr_type(&ea, p);
+
+  ea.cmd = cmd;
+  if (parse_cmd_address(&ea, &errormsg, false) == FAIL) {
+    goto doend;
+  }
+
+  // 5. Parse the command.
+
+  // Skip ':' and any white space
+  ea.cmd = skip_colon_white(ea.cmd, true);
+
+  // If we got a line, but no command, then go to the line.
+  // If we find a '|' or '\n' we set ea.nextcmd.
+  if (*ea.cmd == NUL || *ea.cmd == '"'
+      || (ea.nextcmd = (char *)check_nextcmd((char_u *)ea.cmd)) != NULL) {
+    // strange vi behaviour:
+    // ":3"     jumps to line 3
+    // ":3|..." prints line 3
+    // ":|"     prints current line
+    if (ea.skip) {  // skip this if inside :if
+      goto doend;
+    }
+    if (*ea.cmd == '|' || (exmode_active && ea.line1 != ea.line2)) {
+      ea.cmdidx = CMD_print;
+      ea.argt = EX_RANGE | EX_COUNT | EX_TRLBAR;
+      if ((errormsg = invalid_range(&ea)) == NULL) {
+        correct_range(&ea);
+        ex_print(&ea);
+      }
+    } else if (ea.addr_count != 0) {
+      if (ea.line2 > curbuf->b_ml.ml_line_count) {
+        ea.line2 = curbuf->b_ml.ml_line_count;
+      }
+
+      if (ea.line2 < 0) {
+        errormsg = _(e_invrange);
+      } else {
+        if (ea.line2 == 0) {
+          curwin->w_cursor.lnum = 1;
+        } else {
+          curwin->w_cursor.lnum = ea.line2;
+        }
+        beginline(BL_SOL | BL_FIX);
       }
     }
-    ea.line2 = buflist_findpat(ea.arg, p, (ea.argt & EX_BUFUNL) != 0,
-                               false, false);
-    if (ea.line2 < 0) {  // failed
-      goto doend;
-    }
-    ea.addr_count = 1;
-    ea.arg = skipwhite(p);
+    goto doend;
   }
 
-  // The :try command saves the emsg_silent flag, reset it here when
-  // ":silent! try" was used, it should only apply to :try itself.
-  if (ea.cmdidx == CMD_try && cmdmod.cmod_did_esilent > 0) {
-    emsg_silent -= cmdmod.cmod_did_esilent;
-    if (emsg_silent < 0) {
-      emsg_silent = 0;
+  // If this looks like an undefined user command and there are CmdUndefined
+  // autocommands defined, trigger the matching autocommands.
+  if (p != NULL && ea.cmdidx == CMD_SIZE && !ea.skip
+      && ASCII_ISUPPER(*ea.cmd)
+      && has_event(EVENT_CMDUNDEFINED)) {
+    p = ea.cmd;
+    while (ASCII_ISALNUM(*p)) {
+      ++p;
     }
-    cmdmod.cmod_did_esilent = 0;
+    p = xstrnsave(ea.cmd, (size_t)(p - ea.cmd));
+    int ret = apply_autocmds(EVENT_CMDUNDEFINED, p, p, true, NULL);
+    xfree(p);
+    // If the autocommands did something and didn't cause an error, try
+    // finding the command again.
+    p = (ret && !aborting()) ? find_ex_command(&ea, NULL) : ea.cmd;
+  }
+
+  if (p == NULL) {
+    if (!ea.skip) {
+      errormsg = _(e_ambiguous_use_of_user_defined_command);
+    }
+    goto doend;
+  }
+  // Check for wrong commands.
+  if (ea.cmdidx == CMD_SIZE) {
+    if (!ea.skip) {
+      STRCPY(IObuff, _(e_not_an_editor_command));
+      // If the modifier was parsed OK the error must be in the following
+      // command
+      char *cmdname = after_modifier ? after_modifier : *cmdlinep;
+      if (!(flags & DOCMD_VERBOSE)) {
+        append_command(cmdname);
+      }
+      errormsg = (char *)IObuff;
+      did_emsg_syntax = true;
+      verify_command(cmdname);
+    }
+    goto doend;
+  }
+
+  // set when Not Implemented
+  const int ni = is_cmd_ni(ea.cmdidx);
+
+  // Forced commands.
+  ea.forceit = *p == '!'
+               && ea.cmdidx != CMD_substitute
+               && ea.cmdidx != CMD_smagic
+               && ea.cmdidx != CMD_snomagic;
+  if (ea.forceit) {
+    p++;
+  }
+
+  // 6. Parse arguments.  Then check for errors.
+  if (!IS_USER_CMDIDX(ea.cmdidx)) {
+    ea.argt = cmdnames[(int)ea.cmdidx].cmd_argt;
+  }
+
+  if (!ea.skip) {
+    if (sandbox != 0 && !(ea.argt & EX_SBOXOK)) {
+      // Command not allowed in sandbox.
+      errormsg = _(e_sandbox);
+      goto doend;
+    }
+    if (!MODIFIABLE(curbuf) && (ea.argt & EX_MODIFY)
+        // allow :put in terminals
+        && (!curbuf->terminal || ea.cmdidx != CMD_put)) {
+      // Command not allowed in non-'modifiable' buffer
+      errormsg = _(e_modifiable);
+      goto doend;
+    }
+
+    if (!IS_USER_CMDIDX(ea.cmdidx)) {
+      if (cmdwin_type != 0 && !(ea.argt & EX_CMDWIN)) {
+        // Command not allowed in the command line window
+        errormsg = _(e_cmdwin);
+        goto doend;
+      }
+      if (text_locked() && !(ea.argt & EX_LOCK_OK)) {
+        // Command not allowed when text is locked
+        errormsg = _(get_text_locked_msg());
+        goto doend;
+      }
+    }
+
+    // Disallow editing another buffer when "curbuf->b_ro_locked" is set.
+    // Do allow ":checktime" (it is postponed).
+    // Do allow ":edit" (check for an argument later).
+    // Do allow ":file" with no arguments (check for an argument later).
+    if (!(ea.argt & EX_CMDWIN)
+        && ea.cmdidx != CMD_checktime
+        && ea.cmdidx != CMD_edit
+        && ea.cmdidx != CMD_file
+        && !IS_USER_CMDIDX(ea.cmdidx)
+        && curbuf_locked()) {
+      goto doend;
+    }
+
+    if (!ni && !(ea.argt & EX_RANGE) && ea.addr_count > 0) {
+      // no range allowed
+      errormsg = _(e_norange);
+      goto doend;
+    }
+  }
+
+  if (!ni && !(ea.argt & EX_BANG) && ea.forceit) {  // no <!> allowed
+    errormsg = _(e_nobang);
+    goto doend;
+  }
+
+  // Don't complain about the range if it is not used
+  // (could happen if line_count is accidentally set to 0).
+  if (!ea.skip && !ni && (ea.argt & EX_RANGE)) {
+    // If the range is backwards, ask for confirmation and, if given, swap
+    // ea.line1 & ea.line2 so it's forwards again.
+    // When global command is busy, don't ask, will fail below.
+    if (!global_busy && ea.line1 > ea.line2) {
+      if (msg_silent == 0) {
+        if ((flags & DOCMD_VERBOSE) || exmode_active) {
+          errormsg = _("E493: Backwards range given");
+          goto doend;
+        }
+        if (ask_yesno(_("Backwards range given, OK to swap"), false) != 'y') {
+          goto doend;
+        }
+      }
+      linenr_T lnum = ea.line1;
+      ea.line1 = ea.line2;
+      ea.line2 = lnum;
+    }
+    if ((errormsg = invalid_range(&ea)) != NULL) {
+      goto doend;
+    }
+  }
+
+  if ((ea.addr_type == ADDR_OTHER) && ea.addr_count == 0) {
+    // default is 1, not cursor
+    ea.line2 = 1;
+  }
+
+  correct_range(&ea);
+
+  if (((ea.argt & EX_WHOLEFOLD) || ea.addr_count >= 2) && !global_busy
+      && ea.addr_type == ADDR_LINES) {
+    // Put the first line at the start of a closed fold, put the last line
+    // at the end of a closed fold.
+    (void)hasFolding(ea.line1, &ea.line1, NULL);
+    (void)hasFolding(ea.line2, NULL, &ea.line2);
+  }
+
+  // For the ":make" and ":grep" commands we insert the 'makeprg'/'grepprg'
+  // option here, so things like % get expanded.
+  p = replace_makeprg(&ea, p, cmdlinep);
+  if (p == NULL) {
+    goto doend;
+  }
+
+  // Skip to start of argument.
+  // Don't do this for the ":!" command, because ":!! -l" needs the space.
+  ea.arg = ea.cmdidx == CMD_bang ? p : skipwhite(p);
+
+  // ":file" cannot be run with an argument when "curbuf->b_ro_locked" is set
+  if (ea.cmdidx == CMD_file && *ea.arg != NUL && curbuf_locked()) {
+    goto doend;
+  }
+
+  // Check for "++opt=val" argument.
+  // Must be first, allow ":w ++enc=utf8 !cmd"
+  if (ea.argt & EX_ARGOPT) {
+    while (ea.arg[0] == '+' && ea.arg[1] == '+') {
+      if (getargopt(&ea) == FAIL && !ni) {
+        errormsg = _(e_invarg);
+        goto doend;
+      }
+    }
+  }
+
+  if (ea.cmdidx == CMD_write || ea.cmdidx == CMD_update) {
+    if (*ea.arg == '>') {                       // append
+      if (*++ea.arg != '>') {                   // typed wrong
+        errormsg = _("E494: Use w or w>>");
+        goto doend;
+      }
+      ea.arg = skipwhite(ea.arg + 1);
+      ea.append = true;
+    } else if (*ea.arg == '!' && ea.cmdidx == CMD_write) {  // :w !filter
+      ++ea.arg;
+      ea.usefilter = TRUE;
+    }
+  } else if (ea.cmdidx == CMD_read) {
+    if (ea.forceit) {
+      ea.usefilter = TRUE;                      // :r! filter if ea.forceit
+      ea.forceit = FALSE;
+    } else if (*ea.arg == '!') {              // :r !filter
+      ++ea.arg;
+      ea.usefilter = TRUE;
+    }
+  } else if (ea.cmdidx == CMD_lshift || ea.cmdidx == CMD_rshift) {
+    ea.amount = 1;
+    while (*ea.arg == *ea.cmd) {                // count number of '>' or '<'
+      ea.arg++;
+      ea.amount++;
+    }
+    ea.arg = skipwhite(ea.arg);
+  }
+
+  // Check for "+command" argument, before checking for next command.
+  // Don't do this for ":read !cmd" and ":write !cmd".
+  if ((ea.argt & EX_CMDARG) && !ea.usefilter) {
+    ea.do_ecmd_cmd = getargcmd(&ea.arg);
+  }
+
+  // Check for '|' to separate commands and '"' to start comments.
+  // Don't do this for ":read !cmd" and ":write !cmd".
+  if ((ea.argt & EX_TRLBAR) && !ea.usefilter) {
+    separate_nextcmd(&ea);
+  } else if (ea.cmdidx == CMD_bang
+             || ea.cmdidx == CMD_terminal
+             || ea.cmdidx == CMD_global
+             || ea.cmdidx == CMD_vglobal
+             || ea.usefilter) {
+    // Check for <newline> to end a shell command.
+    // Also do this for ":read !cmd", ":write !cmd" and ":global".
+    // Any others?
+    for (char *s = ea.arg; *s; s++) {
+      // Remove one backslash before a newline, so that it's possible to
+      // pass a newline to the shell and also a newline that is preceded
+      // with a backslash.  This makes it impossible to end a shell
+      // command in a backslash, but that doesn't appear useful.
+      // Halving the number of backslashes is incompatible with previous
+      // versions.
+      if (*s == '\\' && s[1] == '\n') {
+        STRMOVE(s, s + 1);
+      } else if (*s == '\n') {
+        ea.nextcmd = s + 1;
+        *s = NUL;
+        break;
+      }
+    }
+  }
+
+  if ((ea.argt & EX_DFLALL) && ea.addr_count == 0) {
+    set_cmd_dflall_range(&ea);
+  }
+
+  // Parse register and count
+  parse_register(&ea);
+  if (parse_count(&ea, &errormsg, true) == FAIL) {
+    goto doend;
+  }
+
+  // Check for flags: 'l', 'p' and '#'.
+  if (ea.argt & EX_FLAGS) {
+    get_flags(&ea);
+  }
+  if (!ni && !(ea.argt & EX_EXTRA) && *ea.arg != NUL
+      && *ea.arg != '"' && (*ea.arg != '|' || (ea.argt & EX_TRLBAR) == 0)) {
+    // no arguments allowed but there is something
+    errormsg = _(e_trailing);
+    goto doend;
+  }
+
+  if (!ni && (ea.argt & EX_NEEDARG) && *ea.arg == NUL) {
+    errormsg = _(e_argreq);
+    goto doend;
+  }
+
+  if (skip_cmd(&ea)) {
+    goto doend;
   }
 
   // 7. Execute the command.
-  if (IS_USER_CMDIDX(ea.cmdidx)) {
-    /*
-     * Execute a user-defined command.
-     */
-    do_ucmd(&ea, false);
-  } else {
-    /*
-     * Call the function to execute the command.
-     */
-    ea.errmsg = NULL;
-    (cmdnames[ea.cmdidx].cmd_func)(&ea);
-    if (ea.errmsg != NULL) {
-      errormsg = _(ea.errmsg);
-    }
+  int retv = 0;
+  if (execute_cmd0(&retv, &ea, &errormsg, false) == FAIL) {
+    goto doend;
   }
 
-  /*
-   * If the command just executed called do_cmdline(), any throw or ":return"
-   * or ":finish" encountered there must also check the cstack of the still
-   * active do_cmdline() that called this do_one_cmd().  Rethrow an uncaught
-   * exception, or reanimate a returned function or finished script file and
-   * return or finish it again.
-   */
+  // If the command just executed called do_cmdline(), any throw or ":return"
+  // or ":finish" encountered there must also check the cstack of the still
+  // active do_cmdline() that called this do_one_cmd().  Rethrow an uncaught
+  // exception, or reanimate a returned function or finished script file and
+  // return or finish it again.
   if (need_rethrow) {
     do_throw(cstack);
   } else if (check_cstack) {
@@ -2356,7 +2319,7 @@ doend:
         STRCPY(IObuff, errormsg);
         errormsg = (char *)IObuff;
       }
-      append_command(*cmdlinep);
+      append_command(*ea.cmdlinep);
     }
     emsg(errormsg);
   }
@@ -2396,7 +2359,8 @@ char *ex_errmsg(const char *const msg, const char *const arg)
 /// - Set ex_pressedreturn for an empty command line.
 ///
 /// @param skip_only      if false, undo_cmdmod() must be called later to free
-///                       any cmod_filter_pat and cmod_filter_regmatch.regprog.
+///                       any cmod_filter_pat and cmod_filter_regmatch.regprog,
+///                       and ex_pressedreturn may be set.
 /// @param[out] errormsg  potential error message.
 ///
 /// Call apply_cmdmod() to get the side effects of the modifiers:
@@ -2410,7 +2374,7 @@ int parse_command_modifiers(exarg_T *eap, char **errormsg, cmdmod_T *cmod, bool 
 {
   char *p;
 
-  memset(cmod, 0, sizeof(*cmod));
+  CLEAR_POINTER(cmod);
 
   // Repeat until no more command modifiers are found.
   for (;;) {
@@ -2825,11 +2789,13 @@ int parse_cmd_address(exarg_T *eap, char **errormsg, bool silent)
           if (!mark_check(fm)) {
             goto theend;
           }
+          assert(fm != NULL);
           eap->line1 = fm->mark.lnum;
           fm = mark_get_visual(curbuf, '>');
           if (!mark_check(fm)) {
             goto theend;
           }
+          assert(fm != NULL);
           eap->line2 = fm->mark.lnum;
           eap->addr_count++;
         }
@@ -3017,9 +2983,12 @@ char *find_ex_command(exarg_T *eap, int *full)
       if (ASCII_ISLOWER(c2)) {
         eap->cmdidx += cmdidxs2[CHAR_ORD_LOW(c1)][CHAR_ORD_LOW(c2)];
       }
+    } else if (ASCII_ISUPPER(eap->cmd[0])) {
+      eap->cmdidx = CMD_Next;
     } else {
       eap->cmdidx = CMD_bang;
     }
+    assert(eap->cmdidx >= 0);
 
     for (; (int)eap->cmdidx < CMD_SIZE;
          eap->cmdidx = (cmdidx_T)((int)eap->cmdidx + 1)) {
@@ -3239,6 +3208,7 @@ int cmd_exists(const char *const name)
   // For ":2match" and ":3match" we need to skip the number.
   ea.cmd = (char *)((*name == '2' || *name == '3') ? name + 1 : name);
   ea.cmdidx = (cmdidx_T)0;
+  ea.flags = 0;
   int full = false;
   p = find_ex_command(&ea, &full);
   if (p == NULL) {
@@ -3272,6 +3242,7 @@ void f_fullcommand(typval_T *argvars, typval_T *rettv, FunPtr fptr)
 
   ea.cmd = (*name == '2' || *name == '3') ? name + 1 : name;
   ea.cmdidx = (cmdidx_T)0;
+  ea.flags = 0;
   char *p = find_ex_command(&ea, NULL);
   if (p == NULL || ea.cmdidx == CMD_SIZE) {
     return;
@@ -4361,6 +4332,7 @@ static linenr_T get_address(exarg_T *eap, char **ptr, cmd_addr_T addr_type, int 
             cmd = NULL;
             goto error;
           }
+          assert(fm != NULL);
           lnum = fm->mark.lnum;
         }
       }
@@ -4453,7 +4425,7 @@ static linenr_T get_address(exarg_T *eap, char **ptr, cmd_addr_T addr_type, int 
 
     default:
       if (ascii_isdigit(*cmd)) {                // absolute line number
-        lnum = (linenr_T)getdigits((char_u **)&cmd, false, 0);
+        lnum = (linenr_T)getdigits(&cmd, false, 0);
       }
     }
 
@@ -4605,8 +4577,9 @@ char *invalid_range(exarg_T *eap)
       }
       break;
     case ADDR_BUFFERS:
-      if (eap->line1 < firstbuf->b_fnum
-          || eap->line2 > lastbuf->b_fnum) {
+      // Only a boundary check, not whether the buffers actually
+      // exist.
+      if (eap->line1 < 1 || eap->line2 > get_highest_fnum()) {
         return _(e_invrange);
       }
       break;
@@ -4701,78 +4674,46 @@ static char *skip_grep_pat(exarg_T *eap)
 
 /// For the ":make" and ":grep" commands insert the 'makeprg'/'grepprg' option
 /// in the command line, so that things like % get expanded.
-char *replace_makeprg(exarg_T *eap, char *p, char **cmdlinep)
+char *replace_makeprg(exarg_T *eap, char *arg, char **cmdlinep)
 {
-  char *new_cmdline;
-  char *program;
-  char *pos;
-  char *ptr;
-  int len;
-  size_t i;
+  bool isgrep = eap->cmdidx == CMD_grep
+                || eap->cmdidx == CMD_lgrep
+                || eap->cmdidx == CMD_grepadd
+                || eap->cmdidx == CMD_lgrepadd;
 
-  /*
-   * Don't do it when ":vimgrep" is used for ":grep".
-   */
-  if ((eap->cmdidx == CMD_make || eap->cmdidx == CMD_lmake
-       || eap->cmdidx == CMD_grep || eap->cmdidx == CMD_lgrep
-       || eap->cmdidx == CMD_grepadd
-       || eap->cmdidx == CMD_lgrepadd)
+  // Don't do it when ":vimgrep" is used for ":grep".
+  if ((eap->cmdidx == CMD_make || eap->cmdidx == CMD_lmake || isgrep)
       && !grep_internal(eap->cmdidx)) {
-    if (eap->cmdidx == CMD_grep || eap->cmdidx == CMD_lgrep
-        || eap->cmdidx == CMD_grepadd || eap->cmdidx == CMD_lgrepadd) {
-      if (*curbuf->b_p_gp == NUL) {
-        program = (char *)p_gp;
-      } else {
-        program = (char *)curbuf->b_p_gp;
-      }
-    } else {
-      if (*curbuf->b_p_mp == NUL) {
-        program = (char *)p_mp;
-      } else {
-        program = (char *)curbuf->b_p_mp;
-      }
-    }
+    const char *program = isgrep ? (*curbuf->b_p_gp == NUL ? (char *)p_gp : (char *)curbuf->b_p_gp)
+                                 : (*curbuf->b_p_mp == NUL ? (char *)p_mp : (char *)curbuf->b_p_mp);
 
-    p = skipwhite(p);
+    arg = skipwhite(arg);
 
-    if ((pos = strstr(program, "$*")) != NULL) {
-      // replace $* by given arguments
-      i = 1;
-      while ((pos = strstr(pos + 2, "$*")) != NULL) {
-        i++;
-      }
-      len = (int)STRLEN(p);
-      new_cmdline = xmalloc(STRLEN(program) + i * (size_t)(len - 2) + 1);
-      ptr = new_cmdline;
-      while ((pos = strstr(program, "$*")) != NULL) {
-        i = (size_t)(pos - program);
-        memcpy(ptr, program, i);
-        STRCPY(ptr += i, p);
-        ptr += len;
-        program = pos + 2;
-      }
-      STRCPY(ptr, program);
-    } else {
-      new_cmdline = xmalloc(STRLEN(program) + STRLEN(p) + 2);
+    char *new_cmdline;
+    // Replace $* by given arguments
+    if ((new_cmdline = strrep(program, "$*", arg)) == NULL) {
+      // No $* in arg, build "<makeprg> <arg>" instead
+      new_cmdline = xmalloc(STRLEN(program) + STRLEN(arg) + 2);
       STRCPY(new_cmdline, program);
       STRCAT(new_cmdline, " ");
-      STRCAT(new_cmdline, p);
+      STRCAT(new_cmdline, arg);
     }
-    msg_make((char_u *)p);
+
+    msg_make((char_u *)arg);
 
     // 'eap->cmd' is not set here, because it is not used at CMD_make
     xfree(*cmdlinep);
     *cmdlinep = new_cmdline;
-    p = new_cmdline;
+    arg = new_cmdline;
   }
-  return p;
+  return arg;
 }
 
 /// Expand file name in Ex command argument.
 /// When an error is detected, "errormsgp" is set to a non-NULL pointer.
 ///
 /// @return  FAIL for failure, OK otherwise.
-int expand_filename(exarg_T *eap, char_u **cmdlinep, char **errormsgp)
+int expand_filename(exarg_T *eap, char **cmdlinep, char **errormsgp)
 {
   int has_wildcards;            // need to expand wildcards
   char *repl;
@@ -4878,7 +4819,7 @@ int expand_filename(exarg_T *eap, char_u **cmdlinep, char **errormsgp)
       repl = l;
     }
 
-    p = repl_cmdline(eap, p, srclen, repl, (char **)cmdlinep);
+    p = repl_cmdline(eap, p, srclen, repl, cmdlinep);
     xfree(repl);
   }
 
@@ -4905,7 +4846,7 @@ int expand_filename(exarg_T *eap, char_u **cmdlinep, char **errormsgp)
         p = NULL;
       }
       if (p != NULL) {
-        (void)repl_cmdline(eap, eap->arg, STRLEN(eap->arg), p, (char **)cmdlinep);
+        (void)repl_cmdline(eap, eap->arg, STRLEN(eap->arg), p, cmdlinep);
       }
     }
 
@@ -4932,7 +4873,7 @@ int expand_filename(exarg_T *eap, char_u **cmdlinep, char **errormsgp)
       if (p == NULL) {
         return FAIL;
       }
-      (void)repl_cmdline(eap, eap->arg, STRLEN(eap->arg), p, (char **)cmdlinep);
+      (void)repl_cmdline(eap, eap->arg, STRLEN(eap->arg), p, cmdlinep);
       xfree(p);
     }
   }
@@ -5216,7 +5157,7 @@ static int get_tabpage_arg(exarg_T *eap)
     }
 
     p_save = p;
-    tab_number = (int)getdigits((char_u **)&p, false, tab_number);
+    tab_number = (int)getdigits(&p, false, tab_number);
 
     if (relative == 0) {
       if (STRCMP(p, "$") == 0) {
@@ -5499,7 +5440,7 @@ char *uc_validate_name(char *name)
 /// This function takes ownership of compl_arg, compl_luaref, and luaref.
 ///
 /// @return  OK if the command is created, FAIL otherwise.
-int uc_add_command(char *name, size_t name_len, char *rep, uint32_t argt, long def, int flags,
+int uc_add_command(char *name, size_t name_len, const char *rep, uint32_t argt, long def, int flags,
                    int compl, char *compl_arg, LuaRef compl_luaref, LuaRef preview_luaref,
                    cmd_addr_T addr_type, LuaRef luaref, bool force)
   FUNC_ATTR_NONNULL_ARG(1, 3)
@@ -5821,6 +5762,16 @@ static void uc_list(char *name, size_t name_len)
       IObuff[len] = '\0';
       msg_outtrans((char *)IObuff);
 
+      if (cmd->uc_luaref != LUA_NOREF) {
+        char *fn = nlua_funcref_str(cmd->uc_luaref);
+        msg_puts_attr(fn, HL_ATTR(HLF_8));
+        xfree(fn);
+        // put the description on a new line
+        if (*cmd->uc_rep != NUL) {
+          msg_puts("\n                                               ");
+        }
+      }
+
       msg_outtrans_special(cmd->uc_rep, false,
                            name_len == 0 ? Columns - 47 : 0);
       if (p_verbose > 0) {
@@ -5912,7 +5863,7 @@ two_count:
           return FAIL;
         }
 
-        *def = getdigits_long((char_u **)&p, true, 0);
+        *def = getdigits_long(&p, true, 0);
         *argt |= EX_ZEROR;
 
         if (p != val + vallen || vallen == 0) {
@@ -5938,7 +5889,7 @@ invalid_count:
           goto two_count;
         }
 
-        *def = getdigits_long((char_u **)&p, true, 0);
+        *def = getdigits_long(&p, true, 0);
 
         if (p != val + vallen) {
           goto invalid_count;
@@ -6753,9 +6704,18 @@ char *get_user_commands(expand_T *xp FUNC_ATTR_UNUSED, int idx)
   if (idx < buf->b_ucmds.ga_len) {
     return (char *)USER_CMD_GA(&buf->b_ucmds, idx)->uc_name;
   }
+
   idx -= buf->b_ucmds.ga_len;
   if (idx < ucmds.ga_len) {
-    return (char *)USER_CMD(idx)->uc_name;
+    char *name = (char *)USER_CMD(idx)->uc_name;
+
+    for (int i = 0; i < buf->b_ucmds.ga_len; i++) {
+      if (STRCMP(name, USER_CMD_GA(&buf->b_ucmds, i)->uc_name) == 0) {
+        // global command is overruled by buffer-local one
+        return "";
+      }
+    }
+    return name;
   }
   return NULL;
 }
@@ -7711,7 +7671,7 @@ static void ex_tabnext(exarg_T *eap)
     if (eap->arg && *eap->arg != NUL) {
       char *p = eap->arg;
       char *p_save = p;
-      tab_number = (int)getdigits((char_u **)&p, false, 0);
+      tab_number = (int)getdigits(&p, false, 0);
       if (p == p_save || *p_save == '-' || *p_save == '+' || *p != NUL
           || tab_number == 0) {
         // No numbers as argument.
@@ -8692,7 +8652,7 @@ static void ex_later(exarg_T *eap)
   if (*p == NUL) {
     count = 1;
   } else if (isdigit(*p)) {
-    count = getdigits_long((char_u **)&p, false, 0);
+    count = getdigits_long(&p, false, 0);
     switch (*p) {
     case 's':
       ++p; sec = true; break;
@@ -9209,7 +9169,7 @@ static void ex_findpat(exarg_T *eap)
 
   n = 1;
   if (ascii_isdigit(*eap->arg)) {  // get count
-    n = getdigits_long((char_u **)&eap->arg, false, 0);
+    n = getdigits_long(&eap->arg, false, 0);
     eap->arg = skipwhite(eap->arg);
   }
   if (*eap->arg == '/') {   // Match regexp, not just whole words
@@ -9967,7 +9927,7 @@ static void ex_setfiletype(exarg_T *eap)
 static void ex_digraphs(exarg_T *eap)
 {
   if (*eap->arg != NUL) {
-    putdigraph((char_u *)eap->arg);
+    putdigraph(eap->arg);
   } else {
     listdigraphs(eap->forceit);
   }

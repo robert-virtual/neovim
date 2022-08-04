@@ -100,6 +100,74 @@ func Test_ins_complete()
   call delete('Xdir', 'rf')
 endfunc
 
+func Test_omni_dash()
+  func Omni(findstart, base)
+    if a:findstart
+        return 5
+    else
+        echom a:base
+	return ['-help', '-v']
+    endif
+  endfunc
+  set omnifunc=Omni
+  new
+  exe "normal Gofind -\<C-x>\<C-o>"
+  call assert_equal("find -help", getline('$'))
+
+  bwipe!
+  delfunc Omni
+  set omnifunc=
+endfunc
+
+func Test_omni_throw()
+  let g:CallCount = 0
+  func Omni(findstart, base)
+    let g:CallCount += 1
+    if a:findstart
+      throw "he he he"
+    endif
+  endfunc
+  set omnifunc=Omni
+  new
+  try
+    exe "normal ifoo\<C-x>\<C-o>"
+    call assert_false(v:true, 'command should have failed')
+  catch
+    call assert_exception('he he he')
+    call assert_equal(1, g:CallCount)
+  endtry
+
+  bwipe!
+  delfunc Omni
+  unlet g:CallCount
+  set omnifunc=
+endfunc
+
+func Test_completefunc_args()
+  let s:args = []
+  func! CompleteFunc(findstart, base)
+    let s:args += [[a:findstart, empty(a:base)]]
+  endfunc
+  new
+
+  set completefunc=CompleteFunc
+  call feedkeys("i\<C-X>\<C-U>\<Esc>", 'x')
+  call assert_equal([1, 1], s:args[0])
+  call assert_equal(0, s:args[1][0])
+  set completefunc=
+
+  let s:args = []
+  set omnifunc=CompleteFunc
+  call feedkeys("i\<C-X>\<C-O>\<Esc>", 'x')
+  call assert_equal([1, 1], s:args[0])
+  call assert_equal(0, s:args[1][0])
+  set omnifunc=
+
+  bwipe!
+  unlet s:args
+  delfunc CompleteFunc
+endfunc
+
 func s:CompleteDone_CompleteFuncNone( findstart, base )
   throw 'skipped: Nvim does not support v:none'
   if a:findstart
@@ -179,19 +247,6 @@ func Test_CompleteDoneDict()
   au! CompleteDone
 endfunc
 
-func Test_CompleteDone_undo()
-  au CompleteDone * call append(0, "prepend1")
-  new
-  call setline(1, ["line1", "line2"])
-  call feedkeys("Go\<C-X>\<C-N>\<CR>\<ESC>", "tx")
-  call assert_equal(["prepend1", "line1", "line2", "line1", ""],
-              \     getline(1, '$'))
-  undo
-  call assert_equal(["line1", "line2"], getline(1, '$'))
-  bwipe!
-  au! CompleteDone
-endfunc
-
 func s:CompleteDone_CompleteFuncDictNoUserData(findstart, base)
   if a:findstart
     return 0
@@ -268,72 +323,30 @@ func Test_CompleteDoneList()
   au! CompleteDone
 endfunc
 
-func Test_omni_dash()
-  func Omni(findstart, base)
-    if a:findstart
-        return 5
-    else
-        echom a:base
-	return ['-help', '-v']
-    endif
-  endfunc
-  set omnifunc=Omni
+func Test_CompleteDone_undo()
+  au CompleteDone * call append(0, "prepend1")
   new
-  exe "normal Gofind -\<C-x>\<C-o>"
-  call assert_equal("find -help", getline('$'))
-
+  call setline(1, ["line1", "line2"])
+  call feedkeys("Go\<C-X>\<C-N>\<CR>\<ESC>", "tx")
+  call assert_equal(["prepend1", "line1", "line2", "line1", ""],
+              \     getline(1, '$'))
+  undo
+  call assert_equal(["line1", "line2"], getline(1, '$'))
   bwipe!
-  delfunc Omni
-  set omnifunc=
+  au! CompleteDone
 endfunc
 
-func Test_omni_throw()
-  let g:CallCount = 0
-  func Omni(findstart, base)
-    let g:CallCount += 1
-    if a:findstart
-      throw "he he he"
-    endif
-  endfunc
-  set omnifunc=Omni
-  new
-  try
-    exe "normal ifoo\<C-x>\<C-o>"
-    call assert_false(v:true, 'command should have failed')
-  catch
-    call assert_exception('he he he')
-    call assert_equal(1, g:CallCount)
-  endtry
-
-  bwipe!
-  delfunc Omni
-  unlet g:CallCount
-  set omnifunc=
-endfunc
-
-func Test_completefunc_args()
-  let s:args = []
-  func! CompleteFunc(findstart, base)
-    let s:args += [[a:findstart, empty(a:base)]]
-  endfunc
-  new
-
-  set completefunc=CompleteFunc
-  call feedkeys("i\<C-X>\<C-U>\<Esc>", 'x')
-  call assert_equal([1, 1], s:args[0])
-  call assert_equal(0, s:args[1][0])
-  set completefunc=
-
-  let s:args = []
-  set omnifunc=CompleteFunc
-  call feedkeys("i\<C-X>\<C-O>\<Esc>", 'x')
-  call assert_equal([1, 1], s:args[0])
-  call assert_equal(0, s:args[1][0])
-  set omnifunc=
-
-  bwipe!
-  unlet s:args
-  delfunc CompleteFunc
+func Test_CompleteDone_modify()
+  let value = {
+        \ 'word': '',
+        \ 'abbr': '',
+        \ 'menu': '',
+        \ 'info': '',
+        \ 'kind': '',
+        \ 'user_data': '',
+        \ }
+  let v:completed_item = value
+  call assert_equal(value, v:completed_item)
 endfunc
 
 func CompleteTest(findstart, query)
@@ -505,19 +518,6 @@ func Test_ins_completeslash()
   set completeslash=
 endfunc
 
-func Test_issue_7021()
-  CheckMSWindows
-
-  let orig_shellslash = &shellslash
-  set noshellslash
-
-  set completeslash=slash
-  call assert_false(expand('~') =~ '/')
-
-  let &shellslash = orig_shellslash
-  set completeslash=
-endfunc
-
 func Test_pum_stopped_by_timer()
   CheckScreendump
 
@@ -599,6 +599,107 @@ func Test_ins_compl_tag_sft()
   call delete('Xfoo')
   set tags&
   %bwipe!
+endfunc
+
+" Test for 'completefunc' deleting text
+func Test_completefunc_error()
+  new
+  " delete text when called for the first time
+  func CompleteFunc(findstart, base)
+    if a:findstart == 1
+      normal dd
+      return col('.') - 1
+    endif
+    return ['a', 'b']
+  endfunc
+  set completefunc=CompleteFunc
+  call setline(1, ['', 'abcd', ''])
+  call assert_fails('exe "normal 2G$a\<C-X>\<C-U>"', 'E565:')
+
+  " delete text when called for the second time
+  func CompleteFunc2(findstart, base)
+    if a:findstart == 1
+      return col('.') - 1
+    endif
+    normal dd
+    return ['a', 'b']
+  endfunc
+  set completefunc=CompleteFunc2
+  call setline(1, ['', 'abcd', ''])
+  call assert_fails('exe "normal 2G$a\<C-X>\<C-U>"', 'E565:')
+
+  " Jump to a different window from the complete function
+  func CompleteFunc3(findstart, base)
+    if a:findstart == 1
+      return col('.') - 1
+    endif
+    wincmd p
+    return ['a', 'b']
+  endfunc
+  set completefunc=CompleteFunc3
+  new
+  call assert_fails('exe "normal a\<C-X>\<C-U>"', 'E565:')
+  close!
+
+  set completefunc&
+  delfunc CompleteFunc
+  delfunc CompleteFunc2
+  delfunc CompleteFunc3
+  close!
+endfunc
+
+" Test for returning non-string values from 'completefunc'
+func Test_completefunc_invalid_data()
+  new
+  func! CompleteFunc(findstart, base)
+    if a:findstart == 1
+      return col('.') - 1
+    endif
+    return [{}, '', 'moon']
+  endfunc
+  set completefunc=CompleteFunc
+  exe "normal i\<C-X>\<C-U>"
+  call assert_equal('moon', getline(1))
+  set completefunc&
+  close!
+endfunc
+
+" Test for errors in using complete() function
+func Test_complete_func_error()
+  call assert_fails('call complete(1, ["a"])', 'E785:')
+  func ListColors()
+    call complete(col('.'), "blue")
+  endfunc
+  call assert_fails('exe "normal i\<C-R>=ListColors()\<CR>"', 'E474:')
+  func ListMonths()
+    call complete(col('.'), test_null_list())
+  endfunc
+  " Nvim allows a NULL list
+  " call assert_fails('exe "normal i\<C-R>=ListMonths()\<CR>"', 'E474:')
+  delfunc ListColors
+  delfunc ListMonths
+  call assert_fails('call complete_info({})', 'E714:')
+  call assert_equal([], complete_info(['items']).items)
+endfunc
+
+" Test for completing words following a completed word in a line
+func Test_complete_wrapscan()
+  " complete words from another buffer
+  new
+  call setline(1, ['one two', 'three four'])
+  new
+  setlocal complete=w
+  call feedkeys("itw\<C-N>\<C-X>\<C-N>\<C-X>\<C-N>\<C-X>\<C-N>", 'xt')
+  call assert_equal('two three four', getline(1))
+  close!
+  " complete words from the current buffer
+  setlocal complete=.
+  %d
+  call setline(1, ['one two', ''])
+  call cursor(2, 1)
+  call feedkeys("ion\<C-N>\<C-X>\<C-N>\<C-X>\<C-N>\<C-X>\<C-N>", 'xt')
+  call assert_equal('one two one two', getline(2))
+  close!
 endfunc
 
 " Test for completing special characters
@@ -728,6 +829,19 @@ func Test_complete_stop()
   close!
 endfunc
 
+func Test_issue_7021()
+  CheckMSWindows
+
+  let orig_shellslash = &shellslash
+  set noshellslash
+
+  set completeslash=slash
+  call assert_false(expand('~') =~ '/')
+
+  let &shellslash = orig_shellslash
+  set completeslash=
+endfunc
+
 " Test to ensure 'Scanning...' messages are not recorded in messages history
 func Test_z1_complete_no_history()
   new
@@ -737,7 +851,18 @@ func Test_z1_complete_no_history()
   exe "normal owh\<C-X>\<C-K>"
   exe "normal owh\<C-N>"
   call assert_equal(currmess, execute('messages'))
-  close!
+  bwipe!
+endfunc
+
+" A mapping is not used for the key after CTRL-X.
+func Test_no_mapping_for_ctrl_x_key()
+  new
+  inoremap <C-K> <Cmd>let was_mapped = 'yes'<CR>
+  setlocal dictionary=README.txt
+  call feedkeys("aexam\<C-X>\<C-K> ", 'xt')
+  call assert_equal('example ', getline(1))
+  call assert_false(exists('was_mapped'))
+  bwipe!
 endfunc
 
 func FooBarComplete(findstart, base)

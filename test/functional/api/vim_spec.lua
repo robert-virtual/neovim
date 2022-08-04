@@ -1469,6 +1469,17 @@ describe('API', function()
       nvim('win_set_option', win, 'number', true)
       eq(true, nvim('get_option_value', 'number', {win = win}))
     end)
+
+    it('getting current buffer option does not adjust cursor #19381', function()
+      nvim('command', 'new')
+      local buf = nvim('get_current_buf').id
+      local win = nvim('get_current_win').id
+      insert('some text')
+      feed('0v$')
+      eq({1, 9}, nvim('win_get_cursor', win))
+      nvim('get_option_value', 'filetype', {buf = buf})
+      eq({1, 9}, nvim('win_get_cursor', win))
+    end)
   end)
 
   describe('nvim_{get,set}_current_buf, nvim_list_bufs', function()
@@ -3613,6 +3624,38 @@ describe('API', function()
       eq('Error while parsing command line: E464: Ambiguous use of user-defined command',
          pcall_err(meths.parse_cmd, 'F', {}))
     end)
+    it('does not interfere with printing line in Ex mode #19400', function()
+      local screen = Screen.new(60, 7)
+      screen:set_default_attr_ids({
+        [0] = {bold = true, foreground = Screen.colors.Blue},  -- NonText
+        [1] = {bold = true, reverse = true},  -- MsgSeparator
+      })
+      screen:attach()
+      insert([[
+        foo
+        bar]])
+      feed('gQ1')
+      screen:expect([[
+        foo                                                         |
+        bar                                                         |
+        {0:~                                                           }|
+        {0:~                                                           }|
+        {1:                                                            }|
+        Entering Ex mode.  Type "visual" to go to Normal mode.      |
+        :1^                                                          |
+      ]])
+      eq('Error while parsing command line', pcall_err(meths.parse_cmd, '', {}))
+      feed('<CR>')
+      screen:expect([[
+        foo                                                         |
+        bar                                                         |
+        {1:                                                            }|
+        Entering Ex mode.  Type "visual" to go to Normal mode.      |
+        :1                                                          |
+        foo                                                         |
+        :^                                                           |
+      ]])
+    end)
   end)
   describe('nvim_cmd', function()
     it('works', function ()
@@ -3690,6 +3733,12 @@ describe('API', function()
       eq("", meths.cmd({ cmd = "Foo", bang = false }, { output = true }))
     end)
     it('works with modifiers', function()
+      -- with :silent output is still captured
+      eq('1',
+         meths.cmd({ cmd = 'echomsg', args = { '1' }, mods = { silent = true } },
+                   { output = true }))
+      -- with :silent message isn't added to message history
+      eq('', meths.cmd({ cmd = 'messages' }, { output = true }))
       meths.create_user_command("Foo", 'set verbose', {})
       eq("  verbose=1", meths.cmd({ cmd = "Foo", mods = { verbose = 1 } }, { output = true }))
       eq(0, meths.get_option_value("verbose", {}))

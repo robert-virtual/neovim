@@ -37,6 +37,7 @@
 #include "nvim/diff.h"
 #include "nvim/digraph.h"
 #include "nvim/eval.h"
+#include "nvim/eval/vars.h"
 #include "nvim/ex_cmds.h"
 #include "nvim/ex_cmds2.h"
 #include "nvim/ex_docmd.h"
@@ -94,10 +95,18 @@ static char *e_buflocked = N_("E937: Attempt to delete a buffer that is in use")
 // Number of times free_buffer() was called.
 static int buf_free_count = 0;
 
+static int top_file_num = 1;            ///< highest file number
+
 typedef enum {
   kBffClearWinInfo = 1,
   kBffInitChangedtick = 2,
 } BufFreeFlags;
+
+/// @return  the highest possible buffer number
+int get_highest_fnum(void)
+{
+  return top_file_num - 1;
+}
 
 /// Read data from buffer for retrying.
 ///
@@ -443,6 +452,7 @@ bool close_buffer(win_T *win, buf_T *buf, int action, bool abort_if_last, bool i
     return false;
   }
 
+  // check no autocommands closed the window
   if (win != NULL  // Avoid bogus clang warning.
       && win_valid_any_tab(win)) {
     // Set b_last_cursor when closing the last window for the buffer.
@@ -1643,8 +1653,6 @@ void no_write_message_nobang(const buf_T *const buf)
 // functions for dealing with the buffer list
 //
 
-static int top_file_num = 1;            ///< highest file number
-
 /// Initialize b:changedtick and changedtick_val attribute
 ///
 /// @param[out]  buf  Buffer to initialize for.
@@ -2475,6 +2483,9 @@ void buflist_setfpos(buf_T *const buf, win_T *const win, linenr_T lnum, colnr_T 
       wip->wi_mark.view = mark_view_make(win->w_topline, wip->wi_mark.mark);
     }
   }
+  if (win != NULL) {
+    wip->wi_changelistidx = win->w_changelistidx;
+  }
   if (copy_options && win != NULL) {
     // Save the window-specific option values.
     copy_winopt(&win->w_onebuf_opt, &wip->wi_opt);
@@ -2577,6 +2588,9 @@ void get_winopts(buf_T *buf)
     cloneFoldGrowArray(&wip->wi_folds, &curwin->w_folds);
   } else {
     copy_winopt(&curwin->w_allbuf_opt, &curwin->w_onebuf_opt);
+  }
+  if (wip != NULL) {
+    curwin->w_changelistidx = wip->wi_changelistidx;
   }
 
   if (curwin->w_float_config.style == kWinStyleMinimal) {
@@ -3136,18 +3150,16 @@ void maketitle(void)
     if (*p_titlestring != NUL) {
       if (stl_syntax & STL_IN_TITLE) {
         int use_sandbox = false;
-        int save_called_emsg = called_emsg;
+        const int called_emsg_before = called_emsg;
 
         use_sandbox = was_set_insecurely(curwin, "titlestring", 0);
-        called_emsg = false;
         build_stl_str_hl(curwin, buf, sizeof(buf),
                          (char *)p_titlestring, use_sandbox,
                          0, maxlen, NULL, NULL);
         title_str = buf;
-        if (called_emsg) {
+        if (called_emsg > called_emsg_before) {
           set_string_option_direct("titlestring", -1, "", OPT_FREE, SID_ERROR);
         }
-        called_emsg |= save_called_emsg;
       } else {
         title_str = (char *)p_titlestring;
       }
@@ -3252,17 +3264,15 @@ void maketitle(void)
     if (*p_iconstring != NUL) {
       if (stl_syntax & STL_IN_ICON) {
         int use_sandbox = false;
-        int save_called_emsg = called_emsg;
+        const int called_emsg_before = called_emsg;
 
         use_sandbox = was_set_insecurely(curwin, "iconstring", 0);
-        called_emsg = false;
         build_stl_str_hl(curwin, icon_str, sizeof(buf),
                          (char *)p_iconstring, use_sandbox,
                          0, 0, NULL, NULL);
-        if (called_emsg) {
+        if (called_emsg > called_emsg_before) {
           set_string_option_direct("iconstring", -1, "", OPT_FREE, SID_ERROR);
         }
-        called_emsg |= save_called_emsg;
       } else {
         icon_str = (char *)p_iconstring;
       }
@@ -3278,7 +3288,7 @@ void maketitle(void)
       len = (int)STRLEN(buf_p);
       if (len > 100) {
         len -= 100;
-        len += mb_tail_off(buf_p, buf_p + len) + 1;
+        len += utf_cp_tail_off(buf_p, buf_p + len) + 1;
         buf_p += len;
       }
       STRCPY(icon_str, buf_p);
@@ -3460,7 +3470,7 @@ int build_stl_str_hl(win_T *wp, char *out, size_t outlen, char *fmt, int use_san
 
   // Proceed character by character through the statusline format string
   // fmt_p is the current position in the input buffer
-  for (char *fmt_p = usefmt; *fmt_p;) {
+  for (char *fmt_p = usefmt; *fmt_p != NUL;) {
     if (curitem == (int)stl_items_len) {
       size_t new_len = stl_items_len * 3 / 2;
 
@@ -3474,7 +3484,7 @@ int build_stl_str_hl(win_T *wp, char *out, size_t outlen, char *fmt, int use_san
       stl_items_len = new_len;
     }
 
-    if (*fmt_p != NUL && *fmt_p != '%') {
+    if (*fmt_p != '%') {
       prevchar_isflag = prevchar_isitem = false;
     }
 
@@ -5268,15 +5278,22 @@ bool bt_terminal(const buf_T *const buf)
   return buf != NULL && buf->b_p_bt[0] == 't';
 }
 
-/// @return  true if "buf" is a "nofile", "acwrite", "terminal" or "prompt" /
+/// @return  true if "buf" is a "nofile", "acwrite", "terminal" or "prompt"
 ///          buffer.  This means the buffer name is not a file name.
-bool bt_nofile(const buf_T *const buf)
+bool bt_nofilename(const buf_T *const buf)
   FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return buf != NULL && ((buf->b_p_bt[0] == 'n' && buf->b_p_bt[2] == 'f')
                          || buf->b_p_bt[0] == 'a'
                          || buf->terminal
                          || buf->b_p_bt[0] == 'p');
+}
+
+/// @return  true if "buf" has 'buftype' set to "nofile".
+bool bt_nofile(const buf_T *const buf)
+  FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return buf != NULL && buf->b_p_bt[0] == 'n' && buf->b_p_bt[2] == 'f';
 }
 
 /// @return  true if "buf" is a "nowrite", "nofile", "terminal" or "prompt"
@@ -5330,7 +5347,7 @@ char *buf_spname(buf_T *buf)
   }
   // There is no _file_ when 'buftype' is "nofile", b_sfname
   // contains the name as specified by the user.
-  if (bt_nofile(buf)) {
+  if (bt_nofilename(buf)) {
     if (buf->b_fname != NULL) {
       return buf->b_fname;
     }
